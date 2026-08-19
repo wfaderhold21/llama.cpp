@@ -155,6 +155,33 @@ static __global__ void rms_norm_f32(const float * x,
 }
 
 template <int block_size>
+static __global__ void add_rms_norm_mul_f32(
+        const float * x, const float * residual, const float * weight, float * dst,
+        const int ncols, const int64_t nrows, const float eps) {
+    const int64_t row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    x        += row * ncols;
+    residual += row * ncols;
+    dst      += row * ncols;
+
+    float sumsq = 0.0f;
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float value = x[col] + residual[col];
+        sumsq += value * value;
+    }
+
+    extern __shared__ float shared_sum[];
+    sumsq = block_reduce<block_reduce_method::SUM, block_size>(sumsq, shared_sum);
+    const float scale = rsqrtf(sumsq / ncols + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = (x[col] + residual[col]) * scale * weight[col];
+    }
+}
+
+template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
@@ -557,6 +584,59 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+void ggml_cuda_op_add_rms_norm_mul_fused(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor *               add_tensor,
+        ggml_tensor *               rms_norm_tensor,
+        ggml_tensor *               mul_tensor) {
+    GGML_ASSERT(add_tensor->op == GGML_OP_ADD);
+    GGML_ASSERT(rms_norm_tensor->op == GGML_OP_RMS_NORM);
+    GGML_ASSERT(mul_tensor->op == GGML_OP_MUL);
+    GGML_ASSERT(rms_norm_tensor->src[0] == add_tensor);
+
+    const ggml_tensor * weight = nullptr;
+    if (mul_tensor->src[0] == rms_norm_tensor) {
+        weight = mul_tensor->src[1];
+    } else {
+        GGML_ASSERT(mul_tensor->src[1] == rms_norm_tensor);
+        weight = mul_tensor->src[0];
+    }
+
+    const ggml_tensor * x        = add_tensor->src[0];
+    const ggml_tensor * residual = add_tensor->src[1];
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(x, residual));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(mul_tensor));
+    GGML_ASSERT(weight->ne[0] == x->ne[0] && ggml_nelements(weight) == x->ne[0]);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm_tensor->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = x->ne[0];
+    const int64_t nrows = ggml_nrows(x);
+    const int block_size = ncols < 1024 ? 256 : 1024;
+    const size_t shared = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
+    const ggml_cuda_kernel_launch_params launch_params = {
+        dim3(nrows, 1, 1), dim3(block_size, 1, 1), shared, ctx.stream()
+    };
+
+    if (block_size == 256) {
+        ggml_cuda_kernel_launch(add_rms_norm_mul_f32<256>, launch_params,
+            (const float *) x->data, (const float *) residual->data, (const float *) weight->data,
+            (float *) mul_tensor->data, ncols, nrows, eps);
+    } else {
+        ggml_cuda_kernel_launch(add_rms_norm_mul_f32<1024>, launch_params,
+            (const float *) x->data, (const float *) residual->data, (const float *) weight->data,
+            (float *) mul_tensor->data, ncols, nrows, eps);
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
