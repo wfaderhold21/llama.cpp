@@ -248,8 +248,10 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // when `sched_tgt` is null the primary scheduler is used - see [TAG_SCHED_ALT]
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        ggml_backend_sched_t sched_tgt = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -261,6 +263,13 @@ private:
                           llm_graph_type   gtype) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    // true if this (ubatch, gtype) is the shape that owns sched_alt - see [TAG_SCHED_ALT]
+    bool graph_use_sched_alt(const llama_ubatch & ubatch, llm_graph_type gtype) const;
+
+    // the scheduler that owns the graph last built by process_ubatch. Result tensors must be read
+    // back through this one, since it is the allocator that placed them - see [TAG_SCHED_ALT]
+    ggml_backend_sched_t sched_active() const { return sched_cur ? sched_cur : sched.get(); }
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -343,6 +352,23 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // [TAG_SCHED_ALT]
+    // Secondary scheduler, dedicated to one recurring graph shape.
+    //
+    // A context keeps only a single previous graph result (gf_res_prev) and a scheduler owns exactly
+    // one galloc arena, so a context that alternates between several graph shapes can never reuse a
+    // graph: each call finds the previous slot holding a different shape. That forces a rebuild +
+    // ggml_backend_sched_alloc_graph, which re-stamps every split's uid, which in turn resets the
+    // CUDA graph warmup - so such a context never gets CUDA graphs either.
+    //
+    // The DFlash draft context does exactly this, cycling encode -> KV-inject -> noise-block decode
+    // every step. The noise-block decode is the only one of the three with a fixed shape, so we give
+    // it a scheduler of its own where nothing else can evict it. The other two keep sharing `sched`.
+    ggml_backend_sched_ptr sched_alt;
+
+    // the scheduler that owns the graph currently being built / computed / read back
+    ggml_backend_sched_t sched_cur = nullptr;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -366,6 +392,9 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // previous graph result for sched_alt - see [TAG_SCHED_ALT]
+    llm_graph_result_ptr gf_res_alt;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
