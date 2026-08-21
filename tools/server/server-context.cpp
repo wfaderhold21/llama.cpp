@@ -3023,12 +3023,32 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // [TAG_PREFILL_BUDGET]
+        // Cap how many prompt tokens join this batch while other slots are generating.
+        //
+        // Decode tokens are already in the batch at this point, so batch.size() here is exactly the
+        // number of in-flight decodes. Filling the rest of n_batch with prefill makes this iteration
+        // as long as a full prompt-processing pass, and every generating slot waits for it - a large
+        // prompt stalls all in-flight generations for the duration.
+        //
+        // Budget only the prefill contribution. The physical llama_decode chunking and the
+        // non-splittable path below both stay on n_batch: capping the latter would deadlock any slot
+        // whose prompt is larger than the budget, since it can never be split across iterations.
+        const int32_t n_decode_tokens = batch.size();
+
+        const int32_t n_prefill_max =
+            (params_base.n_prefill_max > 0 && n_decode_tokens > 0)
+                ? std::min(n_batch, params_base.n_prefill_max)
+                : n_batch;
+
+        const auto n_prefill_cur = [&]() { return (int32_t) batch.size() - n_decode_tokens; };
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch || n_prefill_cur() >= n_prefill_max) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3437,7 +3457,9 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // [TAG_PREFILL_BUDGET] n_prefill_cur() bounds the prefill share of this batch
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                           batch.size() < n_batch && n_prefill_cur() < n_prefill_max) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

@@ -556,6 +556,11 @@ struct common_params {
     bool multiline_input   = false; // reverse the usage of `\`
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
+
+    // max prompt (prefill) tokens to add to a single batch while other slots are generating.
+    // 0 = unlimited (fill up to n_batch). Bounds how long a large prefill stalls in-flight
+    // decodes; smaller values smooth the tail latency at some cost to prefill throughput.
+    int32_t n_prefill_max  = 0;
     bool no_perf           = false; // disable performance metrics
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation

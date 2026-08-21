@@ -2565,6 +2565,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--prefill-max"}, "N",
+        string_format(
+            "max prompt tokens added to one batch while other slots are generating (default: %d, 0 = unlimited)\n"
+            "bounds how long a large prefill stalls in-flight decodes, at some cost to prefill throughput",
+            params.n_prefill_max),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--prefill-max must be >= 0");
+            }
+            params.n_prefill_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_MAX"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",
