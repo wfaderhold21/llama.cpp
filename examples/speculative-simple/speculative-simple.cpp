@@ -187,6 +187,9 @@ int main(int argc, char ** argv) {
             n_draft_max = std::max(n_draft_max, 0);
 
             // generate a new draft
+            // drop last round's distributions - never verify against stale ones
+            dists.clear();
+
             common_speculative_get_draft_params(spec, seq_id) = {
                 /* .drafting   = */ true,
                 /* .n_max      = */ n_draft_max,

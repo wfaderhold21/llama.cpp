@@ -2315,9 +2315,13 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
 
     if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        // selector head: ~32 nodes per block position
         const uint32_t selector_tokens = std::min<uint32_t>(
                 n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
         res += 32*selector_tokens;
+
+        // dynamic convs: ~8 nodes per tap, 4 conv sites per layer - scales with depth, not tokens
+        res += 32*model.hparams.dflash_conv_kernel_size*model.hparams.n_layer();
     }
 
     uint32_t n_sampling_nodes = 0;

@@ -2933,6 +2933,11 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // drop last round's distributions - a draft impl that does not repopulate
+                        // them must not be verified against stale ones (the size check below is not
+                        // enough: two consecutive drafts can have equal length)
+                        slot.spec_dists.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,

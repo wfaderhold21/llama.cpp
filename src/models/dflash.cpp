@@ -407,10 +407,14 @@ static ggml_tensor * build_dflash2_conv(
 
     const int64_t block_size = n_tokens / n_blocks;
     ggml_context * ctx0 = g.ctx0;
-    hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
-    dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
+    // both inputs are normally already contiguous (build_norm / build_lora_mm output) - reshape then
+    hidden  = ggml_is_contiguous(hidden)
+        ? ggml_reshape_2d(ctx0, hidden,  hidden_size,    n_tokens)
+        : ggml_cont_2d   (ctx0, hidden,  hidden_size,    n_tokens);
+    dynamic = ggml_is_contiguous(dynamic)
+        ? ggml_reshape_2d(ctx0, dynamic, dynamic->ne[0], n_tokens)
+        : ggml_cont_2d   (ctx0, dynamic, dynamic->ne[0], n_tokens);
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
-    ggml_tensor * grouped = ggml_reshape_3d(ctx0, hidden, group_size, n_groups, n_tokens);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
             coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
@@ -435,12 +439,18 @@ static ggml_tensor * build_dflash2_conv(
                 coeffs_side->nb[2], tap * coeffs_side->nb[1]);
         coeff = ggml_cont(ctx0, coeff);
         coeff = ggml_reshape_3d(ctx0, coeff, 1, n_groups, n_tokens);
-        coeff = ggml_reshape_2d(ctx0, ggml_repeat(ctx0, coeff, grouped), hidden_size, n_tokens);
 
         ggml_tensor * base_tap = ggml_view_1d(ctx0, base, hidden_size,
                 tap * base->nb[1] + side * base->nb[2]);
-        ggml_tensor * weight = ggml_add(ctx0, coeff, ggml_repeat(ctx0, base_tap, hidden));
-        ggml_tensor * term = ggml_mul(ctx0, weight, values);
+
+        // (coeff + base) * values, split so that both operands broadcast in place:
+        // coeff is per-group (1, n_groups, n_tokens), base is per-channel (hidden_size).
+        // Materializing either via ggml_repeat would cost a full hidden_size x n_tokens temporary.
+        ggml_tensor * term = ggml_mul(ctx0,
+                ggml_reshape_3d(ctx0, values, group_size, n_groups, n_tokens), coeff);
+        term = ggml_reshape_2d(ctx0, term, hidden_size, n_tokens);
+        term = ggml_add(ctx0, term, ggml_mul(ctx0, values, base_tap));
+
         result = result ? ggml_add(ctx0, result, term) : term;
     }
     return result;
@@ -715,8 +725,14 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
         return;
     }
 
+    // Every block in the batch must have the same number of tokens - the lattice is indexed by
+    // (block, pos) on the CPU side (common/speculative.cpp, draft()), which assumes a uniform
+    // stride. Unequal blocks would misalign the reads rather than fail, hence the assert above.
     const int64_t tokens_per_block = n_tokens / n_blocks;
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
+    // top-k runs over every row including each block's anchor (pos 0), whose candidates are never
+    // read. Slicing the anchors out first would need a full n_vocab x n_tokens strided copy, which
+    // costs far more than the 1/block_size of top-k work it would save.
     ggml_tensor * candidates = ggml_top_k(ctx0, res->t_logits, top_k);
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
     ggml_tensor * unary = ggml_reshape_2d(ctx0,
@@ -741,7 +757,10 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
             tokens_per_block * tokens->nb[0], 0);
     anchor_ids = ggml_cont_1d(ctx0, anchor_ids, n_blocks);
 
-    ggml_tensor * packed = ggml_fill(ctx0,
+    // rows[0] is the anchor slot: the CPU side starts at pos 1 and never reads it, it only keeps
+    // the lattice row indices aligned with the batch's block positions.
+    std::vector<ggml_tensor *> rows(block_size);
+    rows[0] = ggml_fill(ctx0,
             ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, 1, n_blocks), 0.0f);
 
     for (int64_t pos = 1; pos < block_size; ++pos) {
@@ -765,23 +784,36 @@ void llama_model_dflash::graph<is_enc>::build_post_sampling() const {
             predecessor = ggml_reshape_3d(ctx0, predecessor, rank, top_k, n_blocks);
         }
 
-        ggml_tensor * conditioned = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, hidden_pos, predecessor));
+        // hidden_pos is (rank, 1, n_blocks) - ggml_mul broadcasts it over the top_k predecessors
+        ggml_tensor * conditioned = ggml_mul(ctx0, predecessor, hidden_pos);
         ggml_tensor * scores = ggml_mul_mat(ctx0, successor, conditioned);
         if (pos == 1) {
-            scores = ggml_repeat_4d(ctx0, scores, top_k, top_k, n_blocks, 1);
+            // single predecessor (the anchor): pad the remaining rows instead of replicating them.
+            // The CPU side starts at predecessor 0, so only row 0 is ever read here.
+            scores = ggml_pad(ctx0, scores, 0, top_k - 1, 0, 0);
         }
-        ggml_tensor * unary_3d = ggml_reshape_3d(ctx0, unary, top_k, 1, n_blocks);
-        scores = ggml_add(ctx0, scores, ggml_repeat(ctx0, unary_3d, scores));
+        // unary is (top_k, 1, n_blocks) - broadcasts over the predecessor axis
+        scores = ggml_add(ctx0, scores, ggml_reshape_3d(ctx0, unary, top_k, 1, n_blocks));
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, ids, GGML_TYPE_F32),
                 ggml_reshape_2d(ctx0, scores, top_k * top_k, n_blocks), 0);
         row = ggml_pad(ctx0, row, n_embd - row->ne[0], 0, 0, 0);
-        row = ggml_reshape_3d(ctx0, row, n_embd, 1, n_blocks);
-        packed = ggml_concat(ctx0, packed, row, 1);
+        rows[pos] = ggml_reshape_3d(ctx0, row, n_embd, 1, n_blocks);
     }
 
-    packed = ggml_reshape_2d(ctx0, packed, n_embd, block_size * n_blocks);
+    // Concatenate as a balanced tree rather than folding left: a left fold recopies the whole
+    // accumulator every step, which is O(block_size^2) in bytes moved. This is O(block_size log).
+    for (size_t n = rows.size(); n > 1; n = (n + 1)/2) {
+        for (size_t i = 0; i + 1 < n; i += 2) {
+            rows[i/2] = ggml_concat(ctx0, rows[i], rows[i + 1], 1);
+        }
+        if (n % 2) {
+            rows[n/2] = rows[n - 1];
+        }
+    }
+
+    ggml_tensor * packed = ggml_reshape_2d(ctx0, rows[0], n_embd, block_size * n_blocks);
     cb(packed, "dflash2_lattice", -1);
     res->t_h_nextn = packed;
     ggml_build_forward_expand(gf, packed);

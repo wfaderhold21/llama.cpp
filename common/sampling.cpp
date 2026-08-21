@@ -729,8 +729,21 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
     GGML_ASSERT(idxs.size() == draft.size() + 1);
     GGML_ASSERT(dists.size() == draft.size());
 
+    // Residual verification needs the target probabilities from cur_p. When a backend sampler has
+    // already picked the token, common_sampler_sample() returns early without running the CPU chain,
+    // so cur_p still holds raw logits with .p == 0 - every draft token would be rejected and the
+    // residual would be identically zero. Fall back to plain token-equality verification instead.
+    llama_synchronize(ctx);
+    if (llama_get_sampled_token_ith(ctx, idxs[0]) != LLAMA_TOKEN_NULL) {
+        return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    }
+
     std::vector<llama_token> result;
     result.reserve(idxs.size());
+
+    // scratch buffers, reused across draft positions
+    std::unordered_map<llama_token, float> q_probs;
+    std::vector<float> residual;
 
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
     size_t i = 0;
@@ -740,7 +753,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
         const auto & q = dists[i];
         GGML_ASSERT(q.ids.size() == q.probs.size());
 
-        std::unordered_map<llama_token, float> q_probs;
+        q_probs.clear();
         q_probs.reserve(q.ids.size());
         for (size_t j = 0; j < q.ids.size(); ++j) {
             q_probs[q.ids[j]] += q.probs[j];
@@ -766,7 +779,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
             continue;
         }
 
-        std::vector<float> residual(p->size);
+        // Residual p - q over the target's *surviving* candidates. Proposal mass that the target
+        // chain already truncated away (top-k/top-p/min-p) is not represented in p and therefore
+        // not subtracted, so this is maximal coupling only when the chain leaves q's support intact.
+        residual.resize(p->size);
         float residual_sum = 0.0f;
         for (size_t j = 0; j < p->size; ++j) {
             residual[j] = std::max(0.0f, p->data[j].p - q_prob(p->data[j].id));
@@ -775,8 +791,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(
 
         llama_token id = fallback;
         if (residual_sum > 0.0f) {
-            std::discrete_distribution<size_t> sample(residual.begin(), residual.end());
-            id = p->data[sample(gsmpl->speculative_rng)].id;
+            // inverse-CDF over the residual - avoids building a std::discrete_distribution per token
+            float acc = 0.0f;
+            const float target = uniform(gsmpl->speculative_rng) * residual_sum;
+            id = p->data[p->size - 1].id;
+            for (size_t j = 0; j < p->size; ++j) {
+                acc += residual[j];
+                if (acc > target) {
+                    id = p->data[j].id;
+                    break;
+                }
+            }
         }
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);

@@ -1151,7 +1151,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         __func__, rc, (int) n_chunk, (int) offset);
                 return false;
             }
-            // The server may switch contexts before the next draft decode.
+            // batch_inject.embd is a single host buffer reused by every chunk, and llama_decode
+            // uploads it asynchronously - the next iteration's memcpy above would race with an
+            // in-flight H2D copy. Do not hoist this out of the loop without double-buffering embd.
             llama_synchronize(ctx_dft);
         }
 
@@ -1180,6 +1182,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n_draft = params.n_max;
 
+            // NOTE: n_block_tokens must be identical for every drafting seq in this batch. The
+            // DFlash2 selector graph derives its block size as n_tokens / ubatch.n_seqs_unq and
+            // indexes the lattice by (block, pos), so unequal blocks would silently misalign the
+            // reads below. n_draft is params.n_max for all seqs, which is what keeps this true.
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
@@ -1220,6 +1226,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(dp.temperature <= 0.0f || dp.dists);
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+                // lattice rows are laid out (block, pos) in batch order - see the uniform block
+                // size note above, `beg` is only a valid row index because all blocks are equal
+                GGML_ASSERT(beg + n_block_tokens <= batch.n_tokens);
 
                 if (selector_reset[seq_id]) {
                     uint32_t seed = dp.seed;
