@@ -2770,6 +2770,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--expert-cache"}, "N",
+        "keep N expert slabs per MoE layer resident on the GPU and run decode mmvq against them\n"
+        "(experts are placed on pinned host memory so misses stream PCIe; requires CUDA)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache = value;
+            // the loader must land expert tensors on the CUDA pinned-host buft
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"--expert-cache-policy"}, "POLICY",
+        "expert cache eviction policy: lru (implemented) or lfru (parsed, behaves as lru in M2)",
+        [](common_params & params, const std::string & value) {
+            if (value != "lru" && value != "lfru") {
+                throw std::invalid_argument("invalid policy, expected 'lru' or 'lfru'");
+            }
+            params.expert_cache_policy = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_POLICY"));
+
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

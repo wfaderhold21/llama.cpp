@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-ec-hooks.h"
 #include "ggml-impl.h"
 
 #include <assert.h>
@@ -1643,6 +1644,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+ggml_backend_ec_hooks * ggml_backend_ec_hooks_ptr = nullptr;
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1702,7 +1705,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
+                    const auto ec_t0 = std::chrono::steady_clock::now();
                     ggml_backend_synchronize(input_backend);
+                    g_ec_prof_sync += ec_ns(ec_t0);
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1720,6 +1725,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
                             break;
                         }
+                    }
+
+                    // [M2-lite expert slot cache] engage only for decode-sized ubatches: prefill
+                    // keeps the legacy full-slab streaming path byte-identically.
+                    ggml_backend_ec_hooks * ec = ggml_backend_ec_hooks_ptr;
+                    const bool ec_on = ec && ec->active() && ec->is_cuda_buffer(input_cpy) &&
+                        ids_tensor->ne[1] <= 8;
+                    if (ec_on) {
+                        ec->setup(split_backend, input, input_cpy, ids_tensor->ne[1], ggml_nelements(node->src[2]));
+                        // The ids tensor keeps its POINTER across decode steps while its CONTENT
+                        // changes every step (upstream llama.cpp reuses the same ubatch ids buffer).
+                        // The pointer cache below would serve a STALE routing bitset to the cache
+                        // path — force a fresh read on every engaged call.
+                        prev_ids_tensor = NULL;
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
@@ -1743,6 +1762,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (ec_on) {
+                            // prefetch hint only — fill_ids() is the authoritative resolution for
+                            // THIS call's routing; skipping the legacy copy here is decided solely
+                            // by the hit-check below, which sees the ids we just re-read.
+                            for (int32_t eid = first_id; eid <= last_id; ++eid) {
+                                if (!ggml_bitset_get(used_ids.data(), eid)) continue;
+                                int64_t slot; int need_copy;
+                                ec->lookup_or_evict(input_cpy, eid, &slot, &need_copy);
+                                if (need_copy) {
+                                    ec->copy_to_slot(split_backend, input_cpy, eid, slot);
+                                }
+                            }
+                            return;
+                        }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -1779,6 +1812,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+
+                    if (ec_on) {
+                        // map this call's routed ids to slot indices and upload (id ring) so the
+                        // mul_mat_id intercept can run mmvq against the arena directly
+                        ec->fill_ids(split_backend, input_cpy, ids.data(), (int) ids.size());
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface

@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "../ggml-ec-hooks.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -1914,6 +1915,36 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // [M2-lite expert slot cache] decode intercept: run mmvq against the resident device arena with
+    // the slot-indexed ids uploaded by the sched copy phase. Eager-only (graphs forced off at hook
+    // registration). Copy-phase memcpys are stream-ordered ahead of this launch (same backend
+    // stream), so no host sync is needed here. Prefill and non-quantized types fall through.
+    ggml_backend_ec_hooks * ec = ggml_backend_ec_hooks_ptr;
+    const bool ec_served = ec && ec->active() && ec->served_copy_phase(src0);
+    if (ec && ec->active() && !ec_served && ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        extern void ggml_cuda_ec_count_gate_noserve(void); ggml_cuda_ec_count_gate_noserve();
+    }
+    const int32_t * ec_ids_slot = (ec_served && ec->engaged_this_call(src0)) ? ec->ids_slot(src0) : nullptr;
+    if (ec_served && ne2 <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(src0->type) && !ec_ids_slot) {
+        extern void ggml_cuda_ec_count_decline(void); ggml_cuda_ec_count_decline();
+        // the copy phase served this call from the arena but we cannot intercept it (no upload):
+        // refill input_cpy fully, then let the legacy path below read correct data
+        ec->fallback_full(src0, (void *) ctx.stream());
+    }
+    if (ec_ids_slot && ne2 <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(src0->type)) {
+        extern void ggml_cuda_ec_count_intercept(void); ggml_cuda_ec_count_intercept();
+        // mmvq reads ne/nb/data/type from src0 and ids (verified against mmvq.cu entry asserts).
+        ggml_tensor src0_fake = *src0;
+        src0_fake.data  = (void *) ec->arena(src0);
+        src0_fake.ne[2] = ec->cache_slots(src0);   // arena = C contiguous slabs of stride nb[2]
+
+        ggml_tensor ids_fake = *ids;               // same ne/nb/type; data = device slot-index buffer
+        ids_fake.data = (void *) ec_ids_slot;
+
+        ggml_cuda_mul_mat_vec_q(ctx, &src0_fake, src1, &ids_fake, dst);
+        return;
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -2554,6 +2585,16 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+    // [M2-lite expert slot cache] graph replay bypasses the host-side mul_mat_id intercept and the
+    // per-call slot-ids upload, and would replay against a partially-filled input_cpy -> eager only.
+    extern int ggml_cuda_ec_active(void);
+    if (ggml_cuda_ec_active()) {
+        return false;
+    }
+    static const bool force_eager = getenv("GGML_CUDA_FORCE_EAGER") != nullptr; // debug A/B
+    if (force_eager) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -5630,6 +5671,13 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // [M2-lite expert slot cache] when the cache is engaged, decode mul_mat_id MUST be placed on
+    // CUDA so the slot arena serves the GEMMs; placement via the generic min-batch gate would keep
+    // it on CPU (host buft unsupported for discrete GPUs). Scoped to mul_mat_id only.
+    if (op->op == GGML_OP_MUL_MAT_ID && ggml_cuda_ec_active()) {
+        return true;
+    }
+
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
@@ -5699,6 +5747,9 @@ static size_t ggml_backend_cuda_reg_get_device_count(ggml_backend_reg_t reg) {
 }
 
 static ggml_backend_dev_t ggml_backend_cuda_reg_get_device(ggml_backend_reg_t reg, size_t index) {
+    // lazy registry init (called before any model load / graph decision)
+    static bool ec_done = false;
+    if (!ec_done) { ggml_backend_ec_hooks_register(); ec_done = true; }
     ggml_backend_cuda_reg_context * ctx = (ggml_backend_cuda_reg_context *)reg->context;
     GGML_ASSERT(index < ctx->devices.size());
     return ctx->devices[index];

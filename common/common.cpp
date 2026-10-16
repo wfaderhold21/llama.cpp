@@ -1660,6 +1660,16 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
 
+    if (params.expert_cache > 0) {
+        // simple cross-layer channel to the CUDA registry (M2); setenv before model load so
+        // ggml_backend_ec_hooks_register() picks it up at CUDA device init.
+        setenv("LLAMA_EXPERT_CACHE", std::to_string(params.expert_cache).c_str(), 1);
+        setenv("LLAMA_EXPERT_CACHE_POLICY", params.expert_cache_policy.c_str(), 1);
+        // the slot cache is eager-only in M2 (per-call id uploads + copy-phase memcpys are not
+        // graph-expressible yet); common.cuh reads this switch for CUDA graph capture
+        setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
+    }
+
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
