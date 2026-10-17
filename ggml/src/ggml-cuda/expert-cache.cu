@@ -351,7 +351,11 @@ static int hook_setup(ggml_backend_t backend, const ggml_tensor * host, ggml_ten
     e->partial_fill = 0;
     // engage ONLY for decode-sized ubatches (mirrors the intercept's ne2 <= MMVQ_MAX_BATCH gate).
     // Prefill keeps the legacy input_cpy copy path byte-identically.
-    e->engaged   = (n_tokens <= 8) ? 1 : 0;
+    // [M3-G FIX] decline when the call's routed width exceeds the arena: each unique routed id
+    // stamps a slot and stamps are never evictable mid-call, so C < n_ids_elems can leave zero
+    // victims (observed: GGML_ASSERT(victim >= 0) abort at C=16 with SERVE_MAX=4 => 24 stamps).
+    // Declining is safe and exact: engaged=0 -> no serve, legacy full-slab path (stock behavior).
+    e->engaged   = (n_tokens <= 8 && e->C >= n_ids_elems) ? 1 : 0;
     e->last_ids  = nullptr;
     e->last_ids_n = 0;
     (void) backend;
@@ -385,19 +389,21 @@ static int hook_lookup_or_evict(const ggml_tensor * dev, int32_t id, int64_t * o
         if (e->slots[s].expert_id < 0) { victim = s; break; }
     }
     if (victim < 0) {
-        for (int pass = 0; pass < 2 && victim < 0; pass++) {
+        for (int pass = 0; pass < 3 && victim < 0; pass++) {
             uint64_t oldest = UINT64_MAX;
             for (int64_t s = 0; s < e->C; s++) {
                 const ggml_cuda_ec_slot & sl = e->slots[s];
                 if (sl.stamp_gen == e->gen) continue; // in use by this call
                 if (sl.hot && pass == 0) continue;    // keep hot set while any cold victim exists
                 const bool inflight = sl.in_flight && cudaEventQuery(sl.in_flight) == cudaErrorNotReady;
-                if (inflight && oldest != UINT64_MAX) continue; // prefer settled slots
+                if (inflight && pass < 2 && oldest != UINT64_MAX) continue; // prefer settled slots
                 if (sl.last_use < oldest) { oldest = sl.last_use; victim = s; }
             }
         }
     }
-    GGML_ASSERT(victim >= 0); // impossible for decode-sized calls (C >> 6); loud if assumptions break
+    // pass 3 (above) allows hot + in-flight victims: same-stream ordering makes overwriting an
+    // in-flight copy safe as long as the slot is not being READ this call (stamp excludes those).
+    GGML_ASSERT(victim >= 0); // only possible if EVERY slot is stamp==gen: C < routed width — impossible at C>=8
 
     ggml_cuda_ec_slot & sl = e->slots[victim];
     if (sl.expert_id >= 0) {
