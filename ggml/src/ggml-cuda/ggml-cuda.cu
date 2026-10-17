@@ -1920,12 +1920,31 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // registration). Copy-phase memcpys are stream-ordered ahead of this launch (same backend
     // stream), so no host sync is needed here. Prefill and non-quantized types fall through.
     ggml_backend_ec_hooks * ec = ggml_backend_ec_hooks_ptr;
-    const bool ec_served = ec && ec->active() && ec->served_copy_phase(src0);
+    // [M3-F debug] bisect knob: force the intercept-decline path (ec_served stays true, ids slot
+    // withheld -> fallback_full refills input_cpy, legacy GEMM runs). If output matches stock
+    // with this ON, the copy phase + cache bookkeeping are sound and the bug is isolated to the
+    // arena serve (mmvq vs slot ids). Declines should ~= intercepts with it on. Never ship it.
+    static const bool ec_no_serve = getenv("LLAMA_EC_NO_SERVE") != nullptr;
+    // [M3-F FIX] serve ONLY true single-token decode. ids-tensor ne[1] gating at the sched was
+    // <=8 and leaked prefill chunks: setup/engaged are sticky (setup runs only when ec_on fired),
+    // so 2..8-token prefill chunks inherited decode state and got arena-served — observed via the
+    // DUP oracle as ne2=2 serve mismatches at token 1 + illegal access. Stock sends those calls to
+    // mmq/mmf; mmvq-slot-serve there rewrites the logits and greedy decode diverges.
+    // [M3-G] with LLAMA_EC_EXPERIMENTAL=1 the window opens to LLAMA_EC_SERVE_MAX (MTP verify
+    // passes are 1+n_draft token ubatches); must mirror the sched-side gate exactly.
+    static const int64_t ec_serve_max_i = [] {
+        if (!getenv("LLAMA_EC_EXPERIMENTAL")) return (int64_t) 1;
+        const char * s = getenv("LLAMA_EC_SERVE_MAX");
+        int64_t v = s ? strtoll(s, nullptr, 10) : 4;
+        return v < 1 ? (int64_t) 1 : (v > 8 ? (int64_t) 8 : v);
+    }();
+    const bool ec_ne2_ok = (ne2 >= 1 && ne2 <= ec_serve_max_i);
+    const bool ec_served = ec_ne2_ok && ec && ec->active() && ec->served_copy_phase(src0);
     if (ec && ec->active() && !ec_served && ne2 <= MMVQ_MAX_BATCH_SIZE) {
         extern void ggml_cuda_ec_count_gate_noserve(void); ggml_cuda_ec_count_gate_noserve();
     }
-    const int32_t * ec_ids_slot = (ec_served && ec->engaged_this_call(src0)) ? ec->ids_slot(src0) : nullptr;
-    if (ec_served && ne2 <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(src0->type) && !ec_ids_slot) {
+    const int32_t * ec_ids_slot = (ec_served && !ec_no_serve && ec->engaged_this_call(src0)) ? ec->ids_slot(src0) : nullptr;
+    if (ec_served && ggml_is_quantized(src0->type) && !ec_ids_slot) {
         extern void ggml_cuda_ec_count_decline(void); ggml_cuda_ec_count_decline();
         // the copy phase served this call from the arena but we cannot intercept it (no upload):
         // refill input_cpy fully, then let the legacy path below read correct data
@@ -1933,15 +1952,124 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
     if (ec_ids_slot && ne2 <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(src0->type)) {
         extern void ggml_cuda_ec_count_intercept(void); ggml_cuda_ec_count_intercept();
+        // [M3-C diagnostic] time the GPU work this intercept actually launches, per layer:
+        // run the served mmvq then SYNC — exposes whether served-layer GPU work itself is slow
+        // (copy waits / P-state / kernel) vs merely enqueued-and-forgotten.
+        static const bool ec_layer_sync = getenv("LLAMA_EXPERT_CACHE_SYNC") != nullptr;
         // mmvq reads ne/nb/data/type from src0 and ids (verified against mmvq.cu entry asserts).
         ggml_tensor src0_fake = *src0;
         src0_fake.data  = (void *) ec->arena(src0);
         src0_fake.ne[2] = ec->cache_slots(src0);   // arena = C contiguous slabs of stride nb[2]
 
-        ggml_tensor ids_fake = *ids;               // same ne/nb/type; data = device slot-index buffer
+        ggml_tensor ids_fake = *ids;               // same ne/type; data = device slot-index buffer
         ids_fake.data = (void *) ec_ids_slot;
+        // [M3-G] the ring is uploaded COMPACTED (tok*ne[0]+col, see fill_ids stride walk), but
+        // mmvq derives ids_stride from nb[1]. With padded ids rows (llama.cpp shares one big
+        // ids buffer), tok>=1 would read past the compacted rows -> wrong slots (DUP oracle:
+        // mismatch at tok=1 on MTP verify passes; tok=0 decode masked it). Declare the real
+        // ring layout instead.
+        ids_fake.nb[1] = ids->ne[0] * (int64_t) sizeof(int32_t);
+
+        // [M3-F DUP] same-call oracle: run the served launch into scratch A, then refill
+        // input_cpy authoritatively and run the LEGACY launch (src0, ids) into scratch B and
+        // byte-compare. A!=B on token 1 => serve kernel/mapping bug; equal => divergence lives
+        // elsewhere. Sync-heavy; budget-limited diagnostics only, never ship-on.
+        static const bool ec_dup = getenv("LLAMA_EC_DUP") != nullptr;
+        static const uint64_t dup_start  = []{ const char * s = getenv("LLAMA_EC_DUP_START"); return s ? strtoull(s, nullptr, 10) : 0ull; }();
+        static const uint64_t dup_count  = []{ const char * s = getenv("LLAMA_EC_DUP_N");    return s ? strtoull(s, nullptr, 10) : 300ull; }();
+        static std::atomic<uint64_t> dup_seen{0};
+        static bool dup_off = false;
+        const uint64_t dup_c = dup_seen.fetch_add(1) + 1;   // counts served intercepts
+        if (ec_dup && !dup_off && dup_c > dup_start && dup_c <= dup_start + dup_count) {
+            const size_t nb_dst = (size_t) ne0 * ne1 * ne2 * ne3 * ggml_type_size(dst->type);
+            static void * dup_a = nullptr; static void * dup_b = nullptr; static size_t dup_cap = 0;
+            if (nb_dst > dup_cap) {
+                if (dup_a) { cudaFree(dup_a); cudaFree(dup_b); }
+                dup_cap = nb_dst;
+                CUDA_CHECK(cudaMalloc(&dup_a, dup_cap)); CUDA_CHECK(cudaMalloc(&dup_b, dup_cap));
+            }
+            ggml_tensor dst_a = *dst; dst_a.data = dup_a;
+            ggml_cuda_mul_mat_vec_q(ctx, &src0_fake, src1, &ids_fake, &dst_a);
+            std::vector<uint8_t> host_a(nb_dst), host_b(nb_dst);
+            const cudaError_t sync_a = cudaStreamSynchronize(ctx.stream());
+            if (sync_a == cudaSuccess) {
+                CUDA_CHECK(cudaMemcpy(host_a.data(), dup_a, nb_dst, cudaMemcpyDeviceToHost));
+            }
+            // targeted refill (stock copy_experts semantics): copy THIS call's routed expert rows
+            // from host_base into the input_cpy slab so the b-side legacy launch reads exactly
+            // what stock would have. Full-slab fallback_full is correct but 146MB/call; routed
+            // rows are ~6/layer. Dedupe ids first.
+            std::vector<int32_t> ids_live((size_t) (ids->ne[1] * ids->nb[1] / sizeof(int32_t)));
+            const bool ids_hostbuf = ids->buffer &&
+                strcmp(ggml_backend_buffer_name(ids->buffer), "CPU") == 0;
+            if (ids_hostbuf) {
+                for (int64_t i1 = 0; i1 < ids->ne[1]; i1++)
+                    for (int64_t i0 = 0; i0 < ids->ne[0]; i0++)
+                        ids_live[i1 * ids->nb[1] / sizeof(int32_t) + i0] =
+                            ((const int32_t *) ((const char *) ids->data + i1 * ids->nb[1]))[i0];
+            } else {
+                cudaMemcpy(ids_live.data(), ids->data, ids_live.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            }
+            {
+                extern void * ggml_cuda_ec_dev_data(const ggml_tensor *);
+                extern const void * ggml_cuda_ec_host_base(const ggml_tensor *);
+                extern int64_t ggml_cuda_ec_slab(const ggml_tensor *);
+                char * dev_base = (char *) ggml_cuda_ec_dev_data(src0);
+                const char * hbase = (const char *) ggml_cuda_ec_host_base(src0);
+                const int64_t slab = ggml_cuda_ec_slab(src0);
+                if (dev_base && hbase && slab > 0) {
+                    int32_t seen_ids[64]; int n_seen = 0;
+                    for (int64_t i1 = 0; i1 < ids->ne[1]; i1++)
+                        for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                            const int32_t v = ids_live[i1 * ids->nb[1] / sizeof(int32_t) + i0];
+                            if (v < 0 || v >= ne02) continue;
+                            bool dupv = false;
+                            for (int j = 0; j < n_seen && !dupv; j++) dupv = (seen_ids[j] == v);
+                            if (dupv) continue;
+                            if (n_seen < 64) seen_ids[n_seen++] = v;
+                            cudaMemcpyAsync(dev_base + (size_t) v * slab, hbase + (size_t) v * slab,
+                                            slab, cudaMemcpyHostToDevice, ctx.stream());
+                        }
+                }
+            }
+            ggml_tensor dst_b = *dst; dst_b.data = dup_b;
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, &dst_b);
+            const cudaError_t sync_b = cudaStreamSynchronize(ctx.stream());
+            if (sync_b != cudaSuccess) {
+                fprintf(stderr, "[ec-dup] B-LAUNCH-FAIL %s: %s (a-side sync was %s)\n",
+                        ggml_get_name(dst->src[0]), cudaGetErrorString(sync_b), cudaGetErrorString(sync_a));
+                cudaGetLastError();  // clear sticky so the run continues for the remaining budget
+                fflush(stderr);
+                dup_off = true;          // b-side faults once = enough evidence; stop the oracle
+                return;                  // served launch (a) already ran; skip dup re-runs entirely
+            }
+            CUDA_CHECK(cudaMemcpy(host_b.data(), dup_b, nb_dst, cudaMemcpyDeviceToHost));
+            std::vector<int32_t> ring((size_t) (ids->ne[0] * ids->ne[1]));
+            cudaMemcpy(ring.data(), ec_ids_slot, ring.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            if (memcmp(host_a.data(), host_b.data(), nb_dst) != 0) {
+                size_t off = 0; while (off < nb_dst && host_a[off] == host_b[off]) off++;
+                const size_t col = off / ((size_t) ne0 * ggml_type_size(dst->type));
+                const size_t tok = col / (size_t) ne1, eu = col % (size_t) ne1;
+                fprintf(stderr,
+                        "[ec-dup] MISMATCH %s ne=[%lld,%lld,%lld,%lld] bytes=%zu first_diff=%zu col=%zu tok=%zu eu=%zu "
+                        "ids_live[tok*ne0+eu]=%d ring=%d a=%.6g b=%.6g\n",
+                        ggml_get_name(dst->src[0]), (long long) ne0, (long long) ne1, (long long) ne2,
+                        (long long) ne3, nb_dst, off, col, tok, eu,
+                        ids_live.size() ? ids_live[tok * ids->nb[1] / sizeof(int32_t) + eu] : -999,
+                        ring.size() ? ring[tok * ids->ne[0] + eu] : -999,
+                        *(const float *) (host_a.data() + (off & ~3u)), *(const float *) (host_b.data() + (off & ~3u)));
+            }
+        }
 
         ggml_cuda_mul_mat_vec_q(ctx, &src0_fake, src1, &ids_fake, dst);
+        if (ec_layer_sync) {
+            const auto t0 = std::chrono::steady_clock::now();
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            extern void ggml_cuda_ec_count_layer_sync(uint64_t ns);
+            ggml_cuda_ec_count_layer_sync(
+                (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+        }
         return;
     }
 
@@ -2587,9 +2715,15 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     // [M2-lite expert slot cache] graph replay bypasses the host-side mul_mat_id intercept and the
     // per-call slot-ids upload, and would replay against a partially-filled input_cpy -> eager only.
+    // [M3-D EXPERIMENT] LLAMA_EC_GRAPHS=1 overrides this: with the slot-indexed ids ring the
+    // captured mmvq reads a fixed slot-buffer POINTER whose CONTENTS are refreshed every call by
+    // fill_ids (pinned staging + stream-ordered upload), and served miss-copies are pinned-async
+    // on copy_stream with event joins issued before capture. If outputs stay byte-identical vs
+    // eager this path is sound; verify before trusting any number it produces.
     extern int ggml_cuda_ec_active(void);
     if (ggml_cuda_ec_active()) {
-        return false;
+        static const bool ec_graphs = getenv("LLAMA_EC_GRAPHS") != nullptr;
+        if (!ec_graphs) return false;
     }
     static const bool force_eager = getenv("GGML_CUDA_FORCE_EAGER") != nullptr; // debug A/B
     if (force_eager) {
@@ -2609,7 +2743,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+            // [M3-D] in EC graphs mode our intercept serves every decode mul_mat_id from the
+            // arena (no host-fallback sync on the served path), so upstream's needs_sync
+            // graph-ban doesn't apply: it assumes the legacy fallback reads host weights.
+            static const bool ec_graphs_ok = getenv("LLAMA_EC_GRAPHS") != nullptr && ggml_cuda_ec_active();
+            if (ggml_cuda_mul_mat_id_needs_sync(node, cc) && !ec_graphs_ok) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
@@ -4450,6 +4588,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
+        { extern void ggml_cuda_ec_count_graph_launch(void); extern int ggml_cuda_ec_active(void);
+          if (ggml_cuda_ec_active()) ggml_cuda_ec_count_graph_launch(); }
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         GGML_UNUSED(graph_key);

@@ -1646,9 +1646,37 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 ggml_backend_ec_hooks * ggml_backend_ec_hooks_ptr = nullptr;
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+// [M3-A sync-tax profiler] per-site host time, dumped by the CUDA expert-cache atexit hook.
+// Sites indexed by GGML_EC_SITE_* (ggml-ec-hooks.h). Pure measurement: zero behavior change.
+#include <atomic>
+#include <chrono>
+std::atomic<uint64_t> g_ec_prof_ns[GGML_EC_SITE_COUNT];
+std::atomic<uint64_t> g_ec_prof_cnt[GGML_EC_SITE_COUNT];
+static inline uint64_t ec_ns(const std::chrono::steady_clock::time_point & t0) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+#define EC_T0()  const auto ec_t0_ = std::chrono::steady_clock::now()
+#define EC_ACC(site) do { g_ec_prof_ns[site] += ec_ns(ec_t0_); g_ec_prof_cnt[site]++; } while (0)
+
+// One-shot unique-name variant: EC_T0 declares const auto ec_t0_ — two in the same scope collide.
+#define EC_T0U(name) const auto name = std::chrono::steady_clock::now()
+#define EC_ACCU(name, site) do { g_ec_prof_ns[site] += ec_ns(name); g_ec_prof_cnt[site]++; } while (0)
+
+static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sched * sched) {
+    // [M3-C diag] PRE_BUILD: entry -> just before the split loop (residual bookkeeping; split
+    // BUILD itself happens in sched_graph_split upstream of this call).
+    const auto ec_pb_t0 = std::chrono::steady_clock::now();
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // [M3-C diag] full wall-time bracket of the WHOLE split loop + per-phase host accounting.
+    // g_ec_split_wall_ns = total time inside compute_splits; comparing against the token wall
+    // (bench tg rate) attributes the token between scheduler and everything-else.
+    const auto ec_loop_t0 = std::chrono::steady_clock::now();
+
+    // [M3-D diag] split-map ground truth printed from inside compute_splits (see bottom of loop).
+    static const bool ec_map = getenv("LLAMA_EC_MAP") != nullptr;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1656,7 +1684,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // [M3-C diag] per-split host brackets: POST = after graph_compute/event-record until the
+    // next split's top; PRE = ev_wait -> just before graph_compute (ec setup/ids/bitset/fill).
+    auto ec_now_ns = [] { return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    uint64_t ec_post_t0 = ec_now_ns();
+    uint64_t ec_pre_t0  = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        {   const uint64_t now = ec_now_ns();
+            g_ec_prof_ns[split_id ? GGML_EC_SITE_SPLIT_POST : GGML_EC_SITE_PRE_BUILD] +=
+                now - ec_post_t0;
+            g_ec_prof_cnt[split_id ? GGML_EC_SITE_SPLIT_POST : GGML_EC_SITE_PRE_BUILD]++;
+            ec_pre_t0 = now; }   // PRE spans split top -> just before graph_compute (overlap OK)
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -1664,34 +1704,69 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            EC_T0();
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+            EC_ACC(GGML_EC_SITE_SPLIT_SYNC);
         }
 
         // copy the input tensors to the split backend
+        EC_T0U(ec_it_);  // [M3-C diag] whole per-input loop (bisect of split_pre remainder)
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
+            EC_T0U(ec_tc_);  // [M3-F bisect] tensor_copy alone
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            EC_ACCU(ec_tc_, GGML_EC_SITE_TENSOR_COPY);
+            EC_T0U(ec_pd_);  // [M3-F bisect] ec skip-predicate alone
+
+            // [M3-A] When the expert cache SERVED this MoE weight tensor last call, input_cpy is not
+            // read or written by the served path at all (the intercept points the kernel at the arena;
+            // copy_experts skips the legacy set_async). The "wait for the split backend to finish using
+            // the previous input_cpy" gate is therefore dead weight — measured 317us x 48/token of
+            // host-side stream drains. Skip it; fallback_full (never observed) re-syncs itself.
+            ggml_backend_ec_hooks * ec_pre = ggml_backend_ec_hooks_ptr;
+            bool ec_input_skip_wait = false;
+            if (ec_pre && ec_pre->active() && split->graph.n_nodes > 0) {
+                const ggml_tensor * n0 = split->graph.nodes[0];
+                ec_input_skip_wait =
+                    n0->op == GGML_OP_MUL_MAT_ID && n0->src[0] == input_cpy &&
+                    n0->src[2] && n0->src[2]->ne[1] <= 8 &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer) &&
+                    ec_pre->is_cuda_buffer(input_cpy) &&
+                    ec_pre->served_copy_phase(input_cpy);
+            }
+            EC_ACCU(ec_pd_, GGML_EC_SITE_PREDICATE);
+            EC_ACCU(ec_tc_, GGML_EC_SITE_IN_PREP);   // in_prep = tensor_copy + predicate span
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                EC_T0();
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                EC_ACC(GGML_EC_SITE_EV_SYNC);
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
+                // [M3-A EXPERIMENT, NEGATIVE RESULT, REVERTED]: skipping this gate when the arena
+                // served the tensor last call collapsed ev_wait 2005->0.6 ms/token-run but t/s
+                // FELL 12.16 -> 7.90. The sync is load-bearing pacing: it keeps the CUDA driver
+                // queue shallow so kernels launch against a drained stream. Keep the gate.
+                EC_T0();
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                EC_ACC(GGML_EC_SITE_EV_WAIT);
+                EC_T0U(ec_mb_);  // [M3-F diag] moe_branch span: starts here, closes before the else
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
@@ -1705,9 +1780,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    const auto ec_t0 = std::chrono::steady_clock::now();
+                    // [input_sync measures from the moe_branch T0 above; ~free lines between]
                     ggml_backend_synchronize(input_backend);
-                    g_ec_prof_sync += ec_ns(ec_t0);
+                    EC_ACC(GGML_EC_SITE_INPUT_SYNC);
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1727,13 +1802,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
 
-                    // [M2-lite expert slot cache] engage only for decode-sized ubatches: prefill
-                    // keeps the legacy full-slab streaming path byte-identically.
+                    // [M2-lite expert slot cache] engage for decode-sized ubatches (and, when
+                    // LLAMA_EC_SERVE_MAX>1, for small MTP-verify batches up to that token count).
+                    // [M3-F FIX] <=8 leaked PREFILL: llama.cpp can chunk prompts into small
+                    // ubatches, so prefill engaged the arena-serve and diverged from stock (which
+                    // routes those ncols>1 MoE calls to mmq/mmf). Observed: ne=[1856,6,2,1] served
+                    // via mmvq changed token-1 logits. Default strictly ne[1]==1.
+                    // [M3-G] LLAMA_EC_EXPERIMENTAL=1 + LLAMA_EC_SERVE_MAX=1+n_draft opts MTP
+                    // verify ubatches into the serve. RISK: a prompt-tail chunk landing in the
+                    // 2..SERVE_MAX window would also serve (documented; run DUP oracle to vet).
                     ggml_backend_ec_hooks * ec = ggml_backend_ec_hooks_ptr;
+                    static const int64_t ec_serve_max = [] {
+                        if (!getenv("LLAMA_EC_EXPERIMENTAL")) return (int64_t) 1;
+                        const char * s = getenv("LLAMA_EC_SERVE_MAX");
+                        int64_t v = s ? strtoll(s, nullptr, 10) : 4;
+                        return v < 1 ? (int64_t) 1 : (v > 8 ? (int64_t) 8 : v);
+                    }();
                     const bool ec_on = ec && ec->active() && ec->is_cuda_buffer(input_cpy) &&
-                        ids_tensor->ne[1] <= 8;
+                        ids_tensor->ne[1] >= 1 && ids_tensor->ne[1] <= ec_serve_max;
                     if (ec_on) {
-                        ec->setup(split_backend, input, input_cpy, ids_tensor->ne[1], ggml_nelements(node->src[2]));
+                        { EC_T0(); ec->setup(split_backend, input, input_cpy, ids_tensor->ne[1], ggml_nelements(node->src[2])); EC_ACC(GGML_EC_SITE_HOOK_SETUP); }
                         // The ids tensor keeps its POINTER across decode steps while its CONTENT
                         // changes every step (upstream llama.cpp reuses the same ubatch ids buffer).
                         // The pointer cache below would serve a STALE routing bitset to the cache
@@ -1742,9 +1830,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
+                        EC_T0();
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
+                        EC_ACC(GGML_EC_SITE_IDS_SYNC);
 
                         // find the used experts
                         used_ids.clear();
@@ -1762,6 +1852,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        EC_T0U(ec_pc_);  // [M3-C diag] legacy prefetch loop + authoritative resolution
                         if (ec_on) {
                             // prefetch hint only — fill_ids() is the authoritative resolution for
                             // THIS call's routing; skipping the legacy copy here is decided solely
@@ -1774,6 +1865,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     ec->copy_to_slot(split_backend, input_cpy, eid, slot);
                                 }
                             }
+                            EC_ACCU(ec_pc_, GGML_EC_SITE_HOOK_PRECOPY);  // close prefetch-hint span
                             return;
                         }
                         const size_t expert_offset = first_id * expert_size;
@@ -1781,12 +1873,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        EC_T0U(ec_ls_);  // [M3-C] async set enqueue cost
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        EC_ACCU(ec_ls_, GGML_EC_SITE_LEGACY_SET);
+                        EC_ACCU(ec_pc_, GGML_EC_SITE_HOOK_PRECOPY);  // close legacy-copy span
                     };
 
                     int id = 0;
@@ -1816,12 +1911,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ec_on) {
                         // map this call's routed ids to slot indices and upload (id ring) so the
                         // mul_mat_id intercept can run mmvq against the arena directly
-                        ec->fill_ids(split_backend, input_cpy, ids.data(), (int) ids.size());
+                        // [M3-F FIX] ids tensor is row-major ne[0]xne[1] with nb-strides: raw
+                        // ids.size() padding can hold garbage (observed BAD id=1e9 -> declines).
+                        // Compact to exactly the routed ids (same walk as used_ids above).
+                        static std::vector<int32_t> ec_ids;
+                        ec_ids.clear();
+                        if (ids_tensor->nb[0] == (int64_t)sizeof(int32_t) &&
+                            ids_tensor->nb[1] == ids_tensor->ne[0] * (int64_t)sizeof(int32_t)) {
+                            ec_ids.assign(ids.begin(), ids.begin() +
+                                std::min<size_t>(ids.size(), ggml_nelements(ids_tensor)));
+                        } else {
+                            for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++)
+                                for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++)
+                                    ec_ids.push_back(ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) +
+                                                          i0 * ids_tensor->nb[0]/sizeof(int32_t)]);
+                        }
+                        EC_T0();
+                        ec->fill_ids(split_backend, input_cpy, ec_ids.data(), (int) ec_ids.size());
+                        EC_ACC(GGML_EC_SITE_HOOK_FILL);
                     }
+                    EC_ACCU(ec_mb_, GGML_EC_SITE_MOE_BRANCH);  // close moe_branch span
                 } else {
+                    EC_T0U(ec_rc_);  // [M3-F diag] reg_copy span
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        EC_T0();  // [M3-C diag] sync-copy fallback path: TWO full backend
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1829,13 +1944,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                        EC_ACC(GGML_EC_SITE_COPY_FALLBACK);  // host stalls here = full stream drain
                     }
+                    EC_ACC(GGML_EC_SITE_REG_COPY);  // close reg_copy span
                 }
             }
         }
+        EC_ACCU(ec_it_, GGML_EC_SITE_INPUTS_TOTAL);  // [M3-C diag] close per-input-loop span
 
         if (!sched->callback_eval) {
+            {   // [M3-C diag] END split_pre span here: split top -> just before graph_compute
+                const uint64_t now = ec_now_ns();
+                g_ec_prof_ns[GGML_EC_SITE_SPLIT_PRE] += now - ec_pre_t0;
+                g_ec_prof_cnt[GGML_EC_SITE_SPLIT_PRE]++;
+                ec_post_t0 = now; }   // POST resumes from after compute (re-taken after record below)
+            EC_T0();
+            // [M3-C] GPU busy-time probe: engine brackets the split with its own async events;
+            // reaped opportunistically at the next hook_setup (never blocks the hot path).
+            // sum(gpu_busy) vs wall per token => GPU-bound vs host-bound. Env-gated.
+            ggml_backend_ec_hooks * ech = ggml_backend_ec_hooks_ptr;
+            const bool ec_gpu_time = ech && ech->active() && ech->gpu_begin;
+            if (ec_gpu_time) ech->gpu_begin(split_backend);
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (ec_gpu_time) ech->gpu_end(split_backend); // deferred reap: never waits here
+            EC_ACC(GGML_EC_SITE_GRAPH_COMPUTE);
+            // attribute host issue time to the backend kind (generic name, no CUDA includes)
+            const bool ec_is_cpu_split_ = (strcmp(ggml_backend_name(split_backend), "CPU") == 0);
+            g_ec_prof_cnt[ec_is_cpu_split_ ? GGML_EC_SITE_GC_CPU : GGML_EC_SITE_GC_GPU]++;
+            // reuse ec_t0_ from the EC_T0() above: same span, second attribution
+            g_ec_prof_ns[ec_is_cpu_split_ ? GGML_EC_SITE_GC_CPU : GGML_EC_SITE_GC_GPU] += ec_ns(ec_t0_);
+            // [M3-C diagnostic] full drain of this split — CAUTION: this is exactly the
+            // serialization we're hunting; gated OFF (LLAMA_EXPERT_CACHE_DRAIN=1 to enable).
+            // Left ungated once and it faked a 12.16->7.5 "regression". Never measure with it on.
+            static const bool ec_drain_diag = getenv("LLAMA_EXPERT_CACHE_DRAIN") != nullptr;
+            if (ec_drain_diag) {
+                EC_T0();
+                ggml_backend_synchronize(split_backend);
+                EC_ACC(GGML_EC_SITE_GRAPH_DRAIN);
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1880,6 +2026,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         prev_backend_id = split_backend_id;
     }
+
+    // [M3-C diag] host wall inside the whole compute_splits loop (all splits, this call)
+    g_ec_prof_ns[GGML_EC_SITE_SPLIT_WALL] += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - ec_loop_t0).count();
+    g_ec_prof_cnt[GGML_EC_SITE_SPLIT_WALL]++;
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2055,6 +2206,8 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    extern std::atomic<uint64_t> g_ec_prof_ns[]; extern std::atomic<uint64_t> g_ec_prof_cnt[];
+    const auto ec_outer_t0 = std::chrono::steady_clock::now();  // [M3-F] outer: alloc+split+runs
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
@@ -2064,14 +2217,30 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
+    const auto ec_alloc_t1 = std::chrono::steady_clock::now();  // split BUILD + alloc ended here
 
-    return ggml_backend_sched_compute_splits(sched);
+    const enum ggml_status st = ggml_backend_sched_compute_splits(sched);
+    g_ec_prof_ns[GGML_EC_SITE_ALLOC_GRAPH] += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        ec_alloc_t1 - ec_outer_t0).count();
+    g_ec_prof_cnt[GGML_EC_SITE_ALLOC_GRAPH]++;
+    g_ec_prof_ns[GGML_EC_SITE_SCHED_OUTER] += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - ec_outer_t0).count();
+    g_ec_prof_cnt[GGML_EC_SITE_SCHED_OUTER]++;
+    return st;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    extern std::atomic<uint64_t> g_ec_prof_ns[]; extern std::atomic<uint64_t> g_ec_prof_cnt[];
+    static const bool ec_sync_prof = getenv("LLAMA_EXPERT_CACHE") != nullptr;
+    const auto ec_t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    if (ec_sync_prof) {
+        g_ec_prof_ns[GGML_EC_SITE_SCHED_SYNC] += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - ec_t0).count();
+        g_ec_prof_cnt[GGML_EC_SITE_SCHED_SYNC]++;
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization

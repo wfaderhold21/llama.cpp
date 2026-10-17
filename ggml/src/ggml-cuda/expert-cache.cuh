@@ -19,7 +19,9 @@
 struct ggml_cuda_ec_slot {
     int32_t     expert_id = -1;    // expert currently resident (-1 = never used)
     uint64_t    last_use  = 0;     // LRU tick (call generation)
-    cudaEvent_t in_flight = nullptr; // advisory: copy recorded for this slot
+    cudaEvent_t in_flight = nullptr; // [M3-B] REAL gate: miss-copy completion (side stream)
+    bool        loading   = false;   // [M3-B] copy issued on copy_stream, event not yet known-done
+    bool        hot       = false;   // [M3-E] pre-staged hot expert: evict LAST, never before non-hot
     uint64_t    stamp_gen = 0;     // generation of the call that last touched this slot
 };
 
@@ -49,6 +51,29 @@ struct ggml_cuda_ec_entry {
     int        ids_ring_next = 0;
     const int32_t * last_ids   = nullptr;  // most recent uploaded buffer (intercept hands to kernel)
     int64_t         last_ids_n = 0;
+
+    // [M3-D] pinned host staging for the slot-ids upload: graph capture cannot snapshot a
+    // memcpy whose source is pageable, and replay must re-read THIS buffer each token (the
+    // captured memcpy node reads current contents at replay time — same contract as upstream's
+    // graph-safe input uploads). cudaHostAlloc'd once alongside the ring, never freed.
+    int32_t * stage_pinned   = nullptr;
+    int64_t   stage_cap_ints = 0;
+
+    // [M3-B] dedicated H2D copy stream for miss fills: keeps the big copies OFF the kernel
+    // stream so sched event-waits/syncs never drain them; the kernel stream waits only on the
+    // per-slot completion event of slots the current call actually reads.
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t  fork_event  = nullptr;  // fork: copy_stream <- backend stream ordering
+    uint64_t     side_copies = 0;        // count/bytes of side-stream copies (diagnostics)
+    uint64_t     side_bytes  = 0;
+
+    // [M3-E] hot-set pre-staging (Ferrol, Oct 16): rank experts by observed routing frequency
+    // (counted in fill_ids); at warmup trigger, bulk-copy the hottest K into slots and mark
+    // them hot so eviction drains cold slots first. LLAMA_EC_PRELOAD_MB selects K = MB/slab.
+    std::vector<uint64_t> freq;      // per expert_id: routing hits (decode calls)
+    bool           preheated = false;
+    uint64_t       preheat_gen = 0;  // trigger generation (set from env at entry create)
+    uint64_t       preheat_copied = 0;
 };
 
 int ggml_cuda_ec_active(void);
