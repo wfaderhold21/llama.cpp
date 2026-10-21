@@ -432,6 +432,18 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // [expert-cache disk source] loader-filled registry: expert tensor name -> {GGUF path,
+    // absolute data offset}. Filled by llama_model_loader when LLAMA_EXPERT_CACHE_SOURCE=disk;
+    // read by the CUDA (and later Metal) expert-cache engines at entry creation to stream slabs
+    // via pread through pinned staging instead of faulting the expert mmap.
+    struct ggml_ec_file_src {
+        const char * path;
+        uint64_t     offs;
+    };
+    GGML_API void ggml_backend_ec_set_file_source(const char * name, const char * path, uint64_t offs);
+    GGML_API int  ggml_backend_ec_get_file_source(const char * name, struct ggml_ec_file_src * out);
+    GGML_API bool ggml_backend_ec_hooks_active(void);
+
 #ifdef  __cplusplus
 }
 #endif

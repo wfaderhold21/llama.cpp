@@ -1812,7 +1812,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
-
+        size_t ncnt = 0, nbytes = 0; for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) { ncnt++; nbytes += ggml_nbytes(t); }
+        fprintf(stderr, "%s: context buft=%s tensors=%zu bytes=%.1f MiB\n", __func__, buft ? ggml_backend_buft_name(buft) : "(null)", ncnt, nbytes / 1e6);
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {
             continue;
@@ -1834,13 +1835,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+        fprintf(stderr, "%s: [map-branch] buft=%s dev=%s hostptr=%d default=%d mmap=%d lazy=%d\n", __func__,
+                ggml_backend_buft_name(buft), ggml_backend_dev_name(dev), (int) buffer_from_host_ptr_supported,
+                (int) is_default_buft, (int) ml.use_mmap, (int) ctx_key.lazy);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // [Metal EC] an EC run must not register a GPU view over the file mapping: the mapping spans the whole
+        // file because non-EC weights are scattered across it, and that view is what wires memory on Apple Silicon.
+        // Keep mmap aliasing for CPU-device contexts (the guarantee path), allocate real buffers elsewhere.
+        const bool ec_map_skip = ggml_backend_ec_hooks_active() && dev != ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ec_map_skip) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1855,6 +1863,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                fprintf(stderr, "%s: [map-ctx] dev=%s buft=%s range=%.1fMB lazy=%d\n", __func__, ggml_backend_dev_name(dev),
+                        ggml_backend_buft_name(buft), (last - first) / 1048576.0, (int) ctx_key.lazy);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }

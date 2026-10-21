@@ -583,6 +583,7 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     int expert_cache = 0;                       // M2-lite: decode expert slot cache size C per layer (0 = disabled)
     std::string expert_cache_policy = "lru";      // lru | lfru (lfru parsed, behaves as lru in M2)
+    std::string expert_cache_source = "host";     // host = pinned-RAM slab (CUDA product path) | disk = GGUF-file-backed, zero-RAM experts (Mac/unified target)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
     bool single_turn       = false; // single turn chat conversation

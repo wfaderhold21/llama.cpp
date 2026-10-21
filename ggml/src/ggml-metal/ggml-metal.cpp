@@ -3,11 +3,14 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "ggml-metal-impl.h"
+#include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
+#include "../ggml-ec-hooks.h"   // [Metal EC] hook table + lazy registration (NULL default => stock path)
 
 #include <mutex>
 #include <string>
@@ -747,6 +750,25 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
+    // [Metal EC] routing must stay CPU-side: the copy phase reads ids before the split executes, so an
+    // ARGSORT/TOP_K output on a Metal command buffer is not populated at that read.
+    if (ggml_backend_ec_hooks_ptr && ggml_backend_ec_hooks_ptr->active() &&
+        (op->op == GGML_OP_ARGSORT || op->op == GGML_OP_TOP_K)) {
+        return false;
+    }
+
+    // [Metal EC] a Metal kernel can only read tensors that have a real Metal view. An EC-managed weight on a
+    // plain CPU buffer has none, so any op reading it must run CPU-side; the served path reaches those bytes
+    // through its own arena instead. mul_mat_id is exempt: it binds to the arena/ids refs.
+    const bool ec_exempt_moe = op->op == GGML_OP_MUL_MAT_ID && ggml_metal_ec_node_serve_eligible(op);
+    if (ggml_backend_ec_hooks_ptr && ggml_backend_ec_hooks_ptr->active() && !ec_exempt_moe) {
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const ggml_tensor * src = op->src[j];
+            if (src == NULL || src->buffer == NULL) continue;
+            if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer)) != dev) return false;
+        }
+    }
+
     return ggml_metal_device_supports_op(ctx_dev, op);
 }
 
@@ -773,6 +795,14 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 
 static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    // [Metal EC] mirror the CUDA gate: when the cache is engaged, decode mul_mat_id must be placed on
+    // Metal so the slot arena serves the GEMMs; the generic min-batch gate would keep it on CPU.
+    // Scoped to mul_mat_id only.
+    if (op->op == GGML_OP_MUL_MAT_ID && ggml_backend_ec_hooks_ptr && ggml_backend_ec_hooks_ptr->active() &&
+        ggml_metal_ec_node_serve_eligible(op)) {
+        return true;
+    }
 
     return (op->op == GGML_OP_MUL_MAT ||
             op->op == GGML_OP_MUL_MAT_ID) &&
@@ -867,8 +897,16 @@ static size_t ggml_backend_metal_reg_device_count(ggml_backend_reg_t reg) {
 }
 
 static ggml_backend_dev_t ggml_backend_metal_reg_device_get(ggml_backend_reg_t reg, size_t index) {
+    // [Metal EC] lazy registry init (called before any model load / graph decision); registers the
+    // hook table ONLY when LLAMA_EXPERT_CACHE > 0 — default OFF keeps ggml_backend_ec_hooks_ptr NULL
+    // and this backend's dispatch byte-identical to stock.
+    ggml_backend_ec_hooks_register_metal();
+
     ggml_backend_metal_reg_t ctx = (ggml_backend_metal_reg_t)reg->context;
     GGML_ASSERT(index < ctx->devices.size());
+    if (ggml_backend_ec_hooks_ptr) {
+        ggml_metal_ec_capture_device((ggml_metal_device_t) ctx->devices[index]->context);
+    }
     return ctx->devices[index];
 }
 

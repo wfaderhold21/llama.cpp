@@ -937,6 +937,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.cors_origins = "localhost";
     }
 
+    // [Metal EC] env-only runs never execute the --expert-cache lambda, so the exps placement
+    // override is missing and the loader does a stock full upload. Bridge the lazy env here,
+    // before the vector is padded to its null terminator.
+    if (params.expert_cache <= 0) {
+        const char * ec_env = getenv("LLAMA_EXPERT_CACHE");
+        if (ec_env && atoi(ec_env) > 0) {
+            params.expert_cache = atoi(ec_env);
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    }
+
     // pad tensor_buft_overrides for llama_params_fit:
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
@@ -2792,6 +2803,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_cache_policy = value;
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_POLICY"));
+    add_opt(common_arg(
+        {"--expert-cache-source"}, "SOURCE",
+        "where expert slabs live between GPU arena fills: host = pinned RAM mirror (default;\n"
+        "requires enough system RAM to hold all experts) | disk = read on miss directly from the\n"
+        "GGUF file via pread (zero resident expert RAM; slower first touch; for unified-memory\n"
+        "systems like Apple Silicon). The GPU arena/caching behavior is identical either way.\n",
+        [](common_params & params, const std::string & value) {
+            if (value != "host" && value != "disk") {
+                throw std::invalid_argument("invalid source, expected 'host' or 'disk'");
+            }
+            params.expert_cache_source = value;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_SOURCE"));
 
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",

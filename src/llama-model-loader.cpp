@@ -577,6 +577,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.push_back(fname);  // [disk source] path parallel to files[]
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -645,6 +646,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.push_back(fname_split);  // [disk source] path parallel to files[]
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -1113,6 +1115,13 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+// [disk source] mirrors common.h LLM_FFN_EXPS_REGEX; single source of truth for both the placement
+// guard below and init_mappings registration (src/ cannot include common/).
+static const std::regex & ec_exps_re(void) {
+    static const std::regex re("\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+    return re;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1240,6 +1249,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        // [disk source] EC-managed experts must stay on the plain mmap path: an extra-buft
+                        // (repack) materializes all expert bytes in RAM at plan time - the bounded-RSS
+                        // guarantee is the product. pread -> staging is the only path expert bytes take.
+                        if (buft != ggml_backend_cpu_buffer_type() && std::regex_search(tensor_name, ec_exps_re()) &&
+                            getenv("LLAMA_EXPERT_CACHE_SOURCE") && std::string(getenv("LLAMA_EXPERT_CACHE_SOURCE")) == "disk") {
+                            buft = ggml_backend_cpu_buffer_type();
+                        }
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1250,10 +1266,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         buft = overrides->buft;
                     }
 
+                    fprintf(stderr, "[ec-buft] %s -> %s\n", tensor_name.c_str(), buft ? ggml_backend_buft_name(buft) : "(null)");
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
                             tensor_name.c_str(),
                             ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
-                            ggml_backend_buft_name(buft));
+                            buft ? ggml_backend_buft_name(buft) : "(null)");
                     break;
                 }
             }
@@ -1403,11 +1420,39 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
-            ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
+            first_moved_from_buft ? ggml_backend_buft_name(first_moved_from_buft) : "(null)",
+            first_moved_to_buft ? ggml_backend_buft_name(first_moved_to_buft) : "(null)");
     }
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    // [disk source] register expert tensors' GGUF {path, offset} so the EC copy engines can
+    // stream slabs via pread instead of faulting the mapping. Gate: LLAMA_EXPERT_CACHE_SOURCE=disk
+    // (set by common_params to setenv before model load). Regex mirrors common.h LLM_FFN_EXPS_REGEX
+    // (src/ may not include common/) — over-registering is behaviorally harmless: only EC-managed
+    // tensors ever query the registry, and host mode ignores it entirely.
+    if (getenv("LLAMA_EXPERT_CACHE_SOURCE") &&
+        std::string(getenv("LLAMA_EXPERT_CACHE_SOURCE")) == "disk") {
+        int n_reg = 0;
+        for (const auto & kv : weights_map) {
+            if (!std::regex_search(kv.first, ec_exps_re())) {
+                continue;
+            }
+            const auto & w = kv.second;
+            if (w.idx >= file_paths.size() || file_paths[w.idx].empty()) {
+                LLAMA_LOG_WARN("%s: expert tensor %s lives in an fd-embedded GGUF (no path) - "
+                               "expert-cache disk source falls back to mapping reads for it\n",
+                               __func__, kv.first.c_str());
+                continue;
+            }
+            ggml_backend_ec_set_file_source(kv.first.c_str(), file_paths[w.idx].c_str(), w.offs);
+            ec_random[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(kv.second.tensor));
+            n_reg++;
+        }
+        LLAMA_LOG_INFO("%s: expert-cache disk source: registered %d expert tensors (mmap=%s)\n",
+                __func__, n_reg, use_mmap ? "yes" : "NO - experts will be RAM-resident, guarantee void");
+    }
+
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1428,8 +1473,17 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
+            // [disk source] expert ranges join the lazy_ranges exclusion set: skipped by the
+            // whole-file WILLNEED prefetch and marked MADV_RANDOM. Semantics stay mmap-verified
+            // (lazy tensor machinery NOT engaged — the EC engine preads via its own fd).
+            llama_mmap::ranges excl = lazy.for_file(idx);
+            const auto eit = ec_random.find(idx);
+            if (eit != ec_random.end()) {
+                excl.insert(excl.end(), eit->second.begin(), eit->second.end());
+            }
+
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    excl);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

@@ -746,6 +746,21 @@ void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml
     }
 }
 
+// galloc splits an allocation larger than the buffer type max size into a multi-buffer. Only the sub-buffer
+// that contains the tensor data has a backing view, so callers that need one must resolve it here.
+ggml_backend_buffer_t ggml_backend_multi_buffer_get_sub_buffer(ggml_backend_buffer_t buffer, const void * data) {
+    GGML_ASSERT(ggml_backend_buffer_is_multi_buffer(buffer));
+    ggml_backend_multi_buffer_context * ctx = (ggml_backend_multi_buffer_context *) buffer->context;
+    for (size_t i = 0; i < ctx->n_buffers; i++) {
+        ggml_backend_buffer_t b = ctx->buffers[i];
+        const char * base = (const char *) ggml_backend_buffer_get_base(b);
+        if ((const char *) data >= base && (const char *) data < base + ggml_backend_buffer_get_size(b)) {
+            return b;
+        }
+    }
+    return NULL;
+}
+
 // creates a copy of the tensor with the same memory layout
 static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, const struct ggml_tensor * tensor) {
     struct ggml_tensor * dup = ggml_dup_tensor(ctx, tensor);
@@ -845,6 +860,14 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+// [Metal EC] bounded node-input allocation window, same env gate as the copy-phase serve window.
+static int64_t ec_serve_max_window(void) {
+    if (!getenv("LLAMA_EC_EXPERIMENTAL")) return 1;
+    const char * s = getenv("LLAMA_EC_SERVE_MAX");
+    int64_t v = s ? strtoll(s, nullptr, 10) : 4;
+    return v < 1 ? (int64_t) 1 : (v > 8 ? (int64_t) 8 : v);
+}
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -1210,6 +1233,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // this is not uncommon since multiple backends can use host memory, with the same buffer type (eg. BLAS and CPU)
     // additionally, set remaining unassigned nodes to the backend with the most supported inputs
     // only nodes that could not be assigned during expansion due to the backend not supporting the op should be unassigned at this point
+    int ec_gpu_b = -1;
+    for (int b = 0; b < sched->n_backends && ec_gpu_b < 0; b++) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            ec_gpu_b = b;
+        }
+    }
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         if (ggml_is_view_op(node->op)) {
@@ -1218,6 +1247,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         int * node_backend_id = &tensor_backend_id(node);
         if (*node_backend_id == -1) {
             // unassigned node: find the backend with the most supported inputs
+            ggml_backend_ec_hooks * ec_assign = ggml_backend_ec_hooks_ptr;
+            if (ec_gpu_b >= 0 && ec_assign && ec_assign->active() && ec_assign->assign_gpu && ec_assign->assign_gpu(node)) {
+                *node_backend_id = ec_gpu_b;
+                SET_CAUSE(node, "3.ec");
+                continue;
+            }
             int n_supported_best = -1;
             for (int b = 0; b < sched->n_backends; b++) {
                 if (ggml_backend_supports_op(sched->backends[b], node)) {
@@ -1397,27 +1432,44 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                ggml_backend_ec_hooks * ec_h = ggml_backend_ec_hooks_ptr;
+                bool ec_force = ec_h && ec_h->active() && ec_h->force_copy && ec_h->force_copy(node, src);
+                if (src_backend_id != cur_backend_id && (!ggml_backend_sched_buffer_supported(sched, src, cur_backend_id) || ec_force)) {
                     // create a copy of the input in the split's backend
-                    if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
-                        ggml_backend_t backend = sched->backends[cur_backend_id];
-                        for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
-                                ggml_set_input(tensor_copy);
-                                ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                    ggml_backend_t backend = sched->backends[cur_backend_id];
+                    for (int c = 0; c < sched->n_copies; c++) {
+                        struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                        // [Metal EC] bounded node-input allocation for a decode-sized graph: the served path
+                        // reads slots from this buffer, so C slabs are enough. The hook answers 0 for backends
+                        // that keep full-size copies, leaving them untouched.
+                        ggml_backend_ec_hooks * ec_alloc = ggml_backend_ec_hooks_ptr;
+                        int64_t bounded = 0;
+                        if (ec_alloc && ec_alloc->active() && ec_alloc->bounded_ne2 &&
+                            node->op == GGML_OP_MUL_MAT_ID && node->src[0] == src) {
+                            bounded = ec_alloc->bounded_ne2(node, src, ec_serve_max_window());
+                            if (bounded > 0 && bounded < src->ne[2]) {
+                                tensor_copy->ne[2] = bounded;
                             }
-                            tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
-                            SET_CAUSE(tensor_copy, "4.cpy");
                         }
-                        int n_inputs = split->n_inputs++;
-                        if (n_inputs >= split->inputs_capacity) {
-                            ggml_backend_sched_split_inputs_grow(split);
+                        ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                        if (sched->n_copies > 1 || bounded > 0) {
+                            // [garbage-token ROOT CAUSE] EC bounded copies ARE the GPU arenas:
+                            // with n_copies==1 the stock guard skipped FLAG_OUTPUT, so ggml-alloc
+                            // treated the region as free and reassigned it to intermediate nodes
+                            // mid-graph — kernels read activations as expert weights (audit saw
+                            // correct bytes pre-publish, garbage during compute). The flag pins the
+                            // region for the whole graph, like the n_copies>1 case.
+                            ggml_set_input(tensor_copy);
+                            ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                         }
-                        split->inputs[n_inputs] = src;
+                        tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                        SET_CAUSE(tensor_copy, "4.cpy");
                     }
-                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    int n_inputs = split->n_inputs++;
+                    if (n_inputs >= split->inputs_capacity) {
+                        ggml_backend_sched_split_inputs_grow(split);
+                    }
+                    split->inputs[n_inputs] = src;
                 }
             }
         }
@@ -1646,10 +1698,43 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 ggml_backend_ec_hooks * ggml_backend_ec_hooks_ptr = nullptr;
 
+// [disk source] loader-filled registry: expert tensor name -> {GGUF path, absolute data offset}.
+// Populated by llama_model_loader when expert-cache disk source is active; read by the CUDA/Metal
+// cache engines at entry creation to stream slabs via pread instead of touching the host mapping.
+// Declarations in ggml/include/ggml-backend.h (the loader includes ggml.h, not ggml-ec-hooks.h).
+#include <mutex>
+#include <string>
+#include <unordered_map>
+static std::unordered_map<std::string, std::pair<std::string, uint64_t>> g_ec_file_sources;
+static std::mutex g_ec_file_sources_mtx;
+
+void ggml_backend_ec_set_file_source(const char * name, const char * path, uint64_t offs) {
+    std::lock_guard<std::mutex> lock(g_ec_file_sources_mtx);
+    g_ec_file_sources[name] = { path, offs };
+}
+
+int ggml_backend_ec_get_file_source(const char * name, ggml_ec_file_src * out) {
+    std::lock_guard<std::mutex> lock(g_ec_file_sources_mtx);
+    auto it = g_ec_file_sources.find(name);
+    if (it == g_ec_file_sources.end()) {
+        static bool once = false;
+        if (!once && !g_ec_file_sources.empty()) {
+            once = true;
+            fprintf(stderr, "[ec-registry-miss] queried=%s size=%zu sample_key=%s\n", name, g_ec_file_sources.size(),
+                    g_ec_file_sources.begin()->first.c_str());
+        }
+        return 0;
+    }
+    out->path = it->second.first.c_str();  // stable: map never erased after load
+    out->offs = it->second.second;
+    return 1;
+}
+bool ggml_backend_ec_hooks_active(void) {
+    return ggml_backend_ec_hooks_ptr && ggml_backend_ec_hooks_ptr->active();
+}
 // [M3-A sync-tax profiler] per-site host time, dumped by the CUDA expert-cache atexit hook.
 // Sites indexed by GGML_EC_SITE_* (ggml-ec-hooks.h). Pure measurement: zero behavior change.
 #include <atomic>
-#include <chrono>
 std::atomic<uint64_t> g_ec_prof_ns[GGML_EC_SITE_COUNT];
 std::atomic<uint64_t> g_ec_prof_cnt[GGML_EC_SITE_COUNT];
 static inline uint64_t ec_ns(const std::chrono::steady_clock::time_point & t0) {
@@ -1721,27 +1806,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
             EC_T0U(ec_tc_);  // [M3-F bisect] tensor_copy alone
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
             EC_ACCU(ec_tc_, GGML_EC_SITE_TENSOR_COPY);
-            EC_T0U(ec_pd_);  // [M3-F bisect] ec skip-predicate alone
-
-            // [M3-A] When the expert cache SERVED this MoE weight tensor last call, input_cpy is not
-            // read or written by the served path at all (the intercept points the kernel at the arena;
-            // copy_experts skips the legacy set_async). The "wait for the split backend to finish using
-            // the previous input_cpy" gate is therefore dead weight — measured 317us x 48/token of
-            // host-side stream drains. Skip it; fallback_full (never observed) re-syncs itself.
-            ggml_backend_ec_hooks * ec_pre = ggml_backend_ec_hooks_ptr;
-            bool ec_input_skip_wait = false;
-            if (ec_pre && ec_pre->active() && split->graph.n_nodes > 0) {
-                const ggml_tensor * n0 = split->graph.nodes[0];
-                ec_input_skip_wait =
-                    n0->op == GGML_OP_MUL_MAT_ID && n0->src[0] == input_cpy &&
-                    n0->src[2] && n0->src[2]->ne[1] <= 8 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) &&
-                    ec_pre->is_cuda_buffer(input_cpy) &&
-                    ec_pre->served_copy_phase(input_cpy);
-            }
-            EC_ACCU(ec_pd_, GGML_EC_SITE_PREDICATE);
-            EC_ACCU(ec_tc_, GGML_EC_SITE_IN_PREP);   // in_prep = tensor_copy + predicate span
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1770,10 +1834,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
+                // [blocker B] Metal EC: node->src[0] is never rewritten to the split copy, so the
+                // stock equality can never hold for plain-CPU weights. The hook widens the test for
+                // registry-known tensors only; CUDA answers NULL -> test unchanged.
+                ggml_backend_ec_hooks * ec_o = ggml_backend_ec_hooks_ptr;
+                const bool ec_orig_ok = ec_o && ec_o->active() && ec_o->moe_allow_orig_src &&
+                    node->op == GGML_OP_MUL_MAT_ID && ec_o->moe_allow_orig_src(node, input);
                 if (split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID) || ec_orig_ok
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
 
@@ -1787,6 +1857,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
                     ggml_backend_t ids_backend = split_backend;
+                    // [gate74] Metal EC declines ARGSORT/TOP_K -> the router runs on the CPU split,
+                    // so node->src[2] is a host tensor; reading it through the GPU split aborts on a
+                    // nil buffer id (CUDA never hits this: its router chain stays on GPU). Resolve
+                    // the read through the backend the scheduler actually assigned to the ids tensor.
+                    {
+                        ggml_backend_ec_hooks * ec_id = ggml_backend_ec_hooks_ptr;
+                        if (ec_id && ec_id->active() && ids_tensor && ids_tensor->buffer &&
+                            ggml_backend_buffer_is_host(ids_tensor->buffer)) {
+                            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, ids_tensor);
+                            if (b) ids_backend = b;
+                        }
+                    }
 
                     if (ggml_nelements(ids_tensor) == 0) {
                         continue;
@@ -1818,17 +1900,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
                         int64_t v = s ? strtoll(s, nullptr, 10) : 4;
                         return v < 1 ? (int64_t) 1 : (v > 8 ? (int64_t) 8 : v);
                     }();
-                    const bool ec_on = ec && ec->active() && ec->is_cuda_buffer(input_cpy) &&
+                    const bool ec_on = ec && ec->active() && ec->is_gpu_buffer(input_cpy) &&
                         ids_tensor->ne[1] >= 1 && ids_tensor->ne[1] <= ec_serve_max;
+                    static bool ec_off_printed = false;
+                    if (!ec_on && !ec_off_printed) {
+                        ec_off_printed = true;
+                        fprintf(stderr, "[ec-off] hooks=%s active=%d gpu_buf=%d ne1=%lld serve_max=%lld\n",
+                                ggml_backend_ec_hooks_ptr ? "set" : "NULL",
+                                ggml_backend_ec_hooks_ptr ? (int) ggml_backend_ec_hooks_ptr->active() : -1,
+                                ggml_backend_ec_hooks_ptr ? (int) ggml_backend_ec_hooks_ptr->is_gpu_buffer(input_cpy) : -1,
+                                (long long) ids_tensor->ne[1], (long long) ec_serve_max);
+                    }
+                    // [M6-RR] tail-rank window (Strata default 6-9 of top-10 = last 3 ranks;
+                    // default here: last 3 ranks of whatever top-k this model routes).
+                    static const auto ec_rr_rwh = [] {
+                        const char * v = getenv("LLAMA_EC_RR_RANKS"); int lo = -1, hi = -1;
+                        if (v) std::sscanf(v, "%d-%d", &lo, &hi);
+                        return std::pair<int, int>(lo, hi);
+                    }();
+                    static const bool ec_rr_on = getenv("LLAMA_EC_ROUTE_RESIDENT") != nullptr;
                     if (ec_on) {
                         { EC_T0(); ec->setup(split_backend, input, input_cpy, ids_tensor->ne[1], ggml_nelements(node->src[2])); EC_ACC(GGML_EC_SITE_HOOK_SETUP); }
                         // The ids tensor keeps its POINTER across decode steps while its CONTENT
                         // changes every step (upstream llama.cpp reuses the same ubatch ids buffer).
                         // The pointer cache below would serve a STALE routing bitset to the cache
                         // path — force a fresh read on every engaged call.
-                        prev_ids_tensor = NULL;
                     }
 
+                        // [M6-RR] hoisted: filled inside the ids block, read at the rr_apply
+                        // call after fill_ids (which lives outside this block's scope).
+                        static std::vector<int32_t> rr_orig_ids, rr_new_ids;   // dense nt x ne
+                        rr_orig_ids.clear(); rr_new_ids.clear();
+                        const float * rr_probs  = nullptr;
+                        int64_t       rr_stride = 0;
+                        int           rr_mode   = 0;
+                        float         rr_scale  = 1.0f;
+                        void *        rr_wh     = nullptr;
+                        ggml_tensor * rr_wc     = nullptr;
+                        int           rr_ne = 0, rr_nt = 0;
                     if (ids_tensor != prev_ids_tensor) {
                         EC_T0();
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
@@ -1836,6 +1945,158 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
                         ggml_backend_synchronize(ids_backend);
                         EC_ACC(GGML_EC_SITE_IDS_SYNC);
 
+                        // [M6-RR] cache-conditioned routing, IN PLACE on the freshly-read
+                        // private ids copy (EC forces a fresh read every engaged call via
+                        // prev_ids_tensor=NULL): every downstream EC consumer — used_ids bitset,
+                        // prefetch-hint reserve+copy, ec_ids -> fill_ids ring -> intercept mmvq —
+                        // then sees the swapped routing for free. The ids tensor is a VIEW over
+                        // ARGSORT (row stride n_expert ints): index by nb-strides, never dense.
+                        if (ec_on && ec_rr_on && ec->swap_candidate && ec->rr_apply) {
+                            const int64_t ne = ids_tensor->ne[0], nt = ids_tensor->ne[1];
+                            const int64_t sb0 = ids_tensor->nb[0] / (int64_t) sizeof(int32_t);
+                            const int64_t sb1 = ids_tensor->nb[1] / (int64_t) sizeof(int32_t);
+                            ggml_tensor * asrt = ids_tensor;
+                            while (asrt && asrt->op == GGML_OP_VIEW) asrt = asrt->src[0];
+                            if (ne >= 2 && ne <= 32 && nt >= 1 && nt <= 8 &&
+                                ids_tensor->nb[0] == (int64_t) sizeof(int32_t) && sb1 >= ne &&
+                                (size_t) ((nt - 1) * sb1 + (ne - 1) * sb0) < ids.size() &&
+                                asrt && asrt->op == GGML_OP_ARGSORT && asrt->src[0] &&
+                                asrt->src[0]->type == GGML_TYPE_F32 && asrt->src[0]->data) {
+                                ggml_tensor * selp = asrt->src[0];   // selection probs (host F32)
+                                // find THIS layer's MUL(experts, weights): the mmid's weights
+                                // operand MUST be input_cpy (every MoE layer has an identical
+                                // MUL shape; matching shape alone would grab layer 0's). Then
+                                // walk weights back through the norm chain (div/softmax/scale/
+                                // reshape/view) to the GET_ROWS over the selection probs keyed
+                                // by the ids tensor (original or unwrapped ARGSORT).
+                                ggml_tensor * wts = nullptr; ggml_tensor * wrows = nullptr;
+                                int w_mode = 0; float w_scale = 1.0f;
+                                for (int ni = 0; ni < split->graph.n_nodes && !wts; ni++) {
+                                    ggml_tensor * nd = split->graph.nodes[ni];
+                                    if (nd->op != GGML_OP_MUL) continue;
+                                    for (int side = 0; side < 2 && !wts; side++) {
+                                        ggml_tensor * a = nd->src[side];
+                                        ggml_tensor * w = nd->src[1 - side];
+                                        if (!a || a->op != GGML_OP_MUL_MAT_ID ||
+                                            // graphs mode: captured nodes hold capture-era copy POINTERS,
+                                            // so pointer equality vs the runtime input_cpy fails. Names are
+                                            // globally unique full paths ("CUDA0#blk.1.ffn_up_exps.weight#0");
+                                            // substring containment is collision-safe ("blk.1." cannot match
+                                            // inside "blk.11." — the next char there is '1', not '.').
+                                            !((a->src[0] == input_cpy || a->src[0] == input) ||
+                                              (a->src[0]->name && input->name &&
+                                               strstr(a->src[0]->name, input->name) &&
+                                               a->src[0]->ne[2] == input->ne[2] &&
+                                               a->src[0]->nb[2] == input->nb[2])) ||
+                                            ggml_backend_buffer_get_usage(a->src[0]->buffer)
+                                                != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
+                                        // [M6-RR v3] the MUL node sits on the CUDA split, so its
+                                        // weights operand is the split COPY of the CPU-computed
+                                        // MUL result (opaque dup, CUDA buffer). Reverse-lookup the
+                                        // ORIGINAL CPU-side tensor: it is a split input whose
+                                        // current copy == w. Only the original carries the op
+                                        // chain (get_rows over host probs) and a host data
+                                        // pointer we can edit. No original found -> fall through
+                                        // to the plain walk, which then fails closed.
+                                        {
+                                            ggml_tensor * w_orig = nullptr;
+                                            for (int ii = 0; ii < split->n_inputs; ii++) {
+                                                if (tensor_copy(split->inputs[ii], split_backend_id, sched->cur_copy) == w) {
+                                                    w_orig = split->inputs[ii];
+                                                    break;
+                                                }
+                                            }
+                                            static int rr_orig_logged = 0;
+                                            if (!w_orig && ++rr_orig_logged % 400 == 1 && rr_orig_logged > 2000) {
+                                                fprintf(stderr, "[ec-rr-rev] %s: no CPU-side original for operand %s\n",
+                                                    input->name, w && w->name ? w->name : "?");
+                                            }
+                                            if (w_orig) w = w_orig;
+                                        }
+                                        ggml_tensor * t = w; bool bad = false;
+                                        for (int hop = 0; hop < 16 && t && t->op != GGML_OP_GET_ROWS; hop++) {
+                                            switch (t->op) {
+                                                case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_PERMUTE:
+                                                case GGML_OP_CONT:
+                                                    break;
+                                                case GGML_OP_DIV:      w_mode = 1; break;
+                                                case GGML_OP_SOFT_MAX: w_mode = 2; break;
+                                                case GGML_OP_SCALE:    w_scale = *(const float *) t->op_params; break;
+                                                default: bad = true; break;
+                                            }
+                                            if (bad) break;
+                                            t = t->src[0];
+                                        }
+                                        if (bad || !t || t->op != GGML_OP_GET_ROWS) continue;
+                                        ggml_tensor * rows = t;
+                                        const bool ids_ok = (rows->src[1] == ids_tensor) ||
+                                                            (asrt != ids_tensor && rows->src[1] == asrt);
+                                        // !ids_ok OR selection_bias (rows' src[0] != probs tensor):
+                                        // bail closed — our re-synthesis would not reproduce the graph's weights
+                                        if (!ids_ok || !rows->src[0] ||
+                                            rows->src[0]->type != GGML_TYPE_F32 ||
+                                            rows->src[0]->data != selp->data ||
+                                            !w->data || w->type != GGML_TYPE_F32 || w->ne[0] != 1 ||
+                                            w->ne[1] != ne || w->ne[2] != nt) continue;
+                                        wts   = w;
+                                        wrows = rows->src[0];
+                                    }
+                                }
+                                if (wts && wrows->ne[1] == n_expert && wrows->ne[2] == nt &&
+                                    wrows->nb[1] == n_expert * (int64_t) sizeof(float) &&
+                                    wts->nb[0] == (int64_t) sizeof(float) &&
+                                    wts->nb[1] == ne * (int64_t) sizeof(float) &&
+                                    ggml_backend_buffer_is_host(wts->buffer)) {
+                                    // split copy of the operand (target of the belt re-upload)
+                                    for (int i = 0; i < split->n_inputs; i++) {
+                                        if (tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy) == wts) {
+                                            rr_wc = split->inputs[i];
+                                            break;
+                                        }
+                                    }
+                                    rr_probs  = (const float *) wrows->data;
+                                    rr_stride = wrows->nb[2] / (int64_t) sizeof(float);
+                                    rr_mode   = w_mode;
+                                    rr_scale  = w_scale;
+                                    rr_wh     = wts->data;
+                                    rr_ne     = (int) ne;
+                                    rr_nt     = (int) nt;
+                                    rr_orig_ids.resize((size_t) (ne * nt));
+                                    rr_new_ids.resize((size_t) (ne * nt));
+                                    for (int64_t t = 0; t < nt; t++)
+                                        for (int64_t r = 0; r < ne; r++) {
+                                            const int32_t v = ids[t * sb1 + r * sb0];
+                                            rr_orig_ids[(size_t) (t * ne + r)] = v;
+                                            rr_new_ids [(size_t) (t * ne + r)] = v;
+                                        }
+                                    const int rlo = ec_rr_rwh.first  >= 0 ? ec_rr_rwh.first
+                                                                            : (int) (ne - 3);
+                                    const int rhi = ec_rr_rwh.second >= 0 ? ec_rr_rwh.second
+                                                                            : (int) (ne - 1);
+                                    bool any = false;
+                                    for (int64_t t = 0; t < nt; t++) {
+                                        int32_t * row = rr_new_ids.data() + t * ne;   // LIVE row
+                                        for (int r = rlo; r <= rhi && r < (int) ne; r++) {
+                                            int32_t nw = -1;
+                                            if (ec->swap_candidate(input_cpy, row[r],
+                                                    rr_probs + t * rr_stride, row, (int) ne, &nw) &&
+                                                nw >= 0 && nw != row[r]) {
+                                                bool clash = false;
+                                                for (int64_t q = 0; q < ne && !clash; q++) clash = (row[q] == nw);
+                                                if (!clash) {
+                                                    ids[t * sb1 + r * sb0] = nw;   // THE mutation
+                                                    row[r] = nw; any = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (!any) {
+                                        rr_orig_ids.clear(); rr_new_ids.clear();
+                                        rr_wh = nullptr; rr_wc = nullptr;
+                                    }
+                                }
+                            }
+                        }
                         // find the used experts
                         used_ids.clear();
                         used_ids.resize(ggml_bitset_size(n_expert));
@@ -1853,7 +2114,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         EC_T0U(ec_pc_);  // [M3-C diag] legacy prefetch loop + authoritative resolution
-                        if (ec_on) {
+                        if (ec_on && ec->engaged_this_call(input_cpy)) {   // ids wider than the slots fall back to the legacy fill
                             // prefetch hint only — fill_ids() is the authoritative resolution for
                             // THIS call's routing; skipping the legacy copy here is decided solely
                             // by the hit-check below, which sees the ids we just re-read.
@@ -1874,6 +2135,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
                         EC_T0U(ec_ls_);  // [M3-C] async set enqueue cost
+                        // [disk source] file-backed expert: stream the slab range from the GGUF
+                        // through the engine's pinned staging ring instead of reading host->data
+                        // (which would fault ~21 GB of page cache on unified-memory machines).
+                        // Stream-ordering contract is identical to the set_async below: both are
+                        // enqueued on the split backend, GEMM reads join on the same stream.
+                        if (ec && ec->disk && ec->disk(input) && ec->copy_slabs) {
+                            // engine's ring is slab-granular: loop per used id in [first,last].
+                            // Padding-NaN tail (MMQ needs no-NaNs in the last expert's padding):
+                            // disk path fills exact slabs; the input_cpy padding was memset at
+                            // alloc — stock pads by copying neighbor bytes. Vet on sporc; if MMQ
+                            // NaNs surface, copy one extra slab window like stock does.
+                            for (int32_t eid = first_id; eid <= last_id; ++eid) {
+                                if (!ggml_bitset_get(used_ids.data(), eid)) continue;
+                                ec->copy_slabs(split_backend, input_cpy, eid, eid);
+                            }
+                            EC_ACCU(ec_ls_, GGML_EC_SITE_LEGACY_SET);
+                            EC_ACCU(ec_pc_, GGML_EC_SITE_HOOK_PRECOPY);
+                            return;
+                        }
+                        // [gate73/78 OOB rail] an EC bounded copy holds C slabs, not n_expert: a stock
+                        // set_async writes full-size slab offsets into a C-slab buffer -> GPU OOB. The
+                        // served path (lookup_or_evict + copy_to_slot) and ec->copy_slabs above are the
+                        // only legal writers for a bounded buffer; skip the raw fill and say so loudly.
+                        if (ec && ec->active() && !ggml_are_same_layout(input, input_cpy)) {
+                            static int ob = 0;
+                            if (ob++ < 4) {
+                                fprintf(stderr, "[ec-oob-guard] %s stock fill skipped (bounded cpy ne2=%lld vs %lld) engaged=%d\n",
+                                        input->name, (long long) input_cpy->ne[2], (long long) input->ne[2],
+                                        (int) (ec_on && ec->engaged_this_call(input_cpy)));
+                            }
+                            EC_ACCU(ec_ls_, GGML_EC_SITE_LEGACY_SET);
+                            EC_ACCU(ec_pc_, GGML_EC_SITE_HOOK_PRECOPY);
+                            return;
+                        }
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
@@ -1927,12 +2222,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
                                                           i0 * ids_tensor->nb[0]/sizeof(int32_t)]);
                         }
                         EC_T0();
-                        ec->fill_ids(split_backend, input_cpy, ec_ids.data(), (int) ec_ids.size());
+                        const int ec_fill_rc = ec->fill_ids(split_backend, input_cpy, ec_ids.data(), (int) ec_ids.size());
+                        // [M6-RR] weights follow ONLY when fill_ids accepted the swapped ring
+                        // (rc==1). BAD-id decline (rc==0) sets engaged=0: the intercept falls
+                        // back, legacy reads the ORIGINAL device ids and — because rr_apply has
+                        // not run — byte-original weights. Zero edits on that path.
+                        if (rr_wh && ec_fill_rc == 1 && !rr_orig_ids.empty()) {
+                            ec->rr_apply(split_backend, input_cpy, rr_probs, rr_stride,
+                                         rr_orig_ids.data(), rr_new_ids.data(), rr_ne, rr_nt,
+                                         rr_wh, rr_wc, rr_mode, rr_scale);
+                        }
                         EC_ACC(GGML_EC_SITE_HOOK_FILL);
                     }
                     EC_ACCU(ec_mb_, GGML_EC_SITE_MOE_BRANCH);  // close moe_branch span
                 } else {
                     EC_T0U(ec_rc_);  // [M3-F diag] reg_copy span
+                    ggml_backend_ec_hooks * ec_cp = ggml_backend_ec_hooks_ptr;
+                    static int em = 0;
+                    if (ec_cp && ec_cp->active() && ec_cp->disk && ec_cp->disk(input) && !em) {
+                        em++;
+                        fprintf(stderr, "[ec-miss] %s usage=%d host=%d node0=%d n_nodes=%d split_be=%s\n", input->name,
+                                (int) ggml_backend_buffer_get_usage(input->buffer), (int) ggml_backend_buffer_is_host(input->buffer),
+                                (int) (split->graph.n_nodes > 0 ? split->graph.nodes[0]->op : -1), split->graph.n_nodes,
+                                ggml_backend_name(split_backend));
+                    }
+                    // [Metal EC] a bounded copy holds C slots, not n_expert - the layouts differ by design.
+                    // The served path fills those slots from the file registry, so there is nothing to copy.
+                    if (ec_cp && ec_cp->active() && !ggml_are_same_layout(input, input_cpy)) {
+                        EC_ACCU(ec_rc_, GGML_EC_SITE_REG_COPY);
+                        continue;
+                    }
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1946,7 +2265,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(struct ggml_backend_sc
                         ggml_backend_tensor_copy(input, input_cpy);
                         EC_ACC(GGML_EC_SITE_COPY_FALLBACK);  // host stalls here = full stream drain
                     }
-                    EC_ACC(GGML_EC_SITE_REG_COPY);  // close reg_copy span
+                    EC_ACCU(ec_rc_, GGML_EC_SITE_REG_COPY);  // close reg_copy span
                 }
             }
         }
@@ -2090,6 +2409,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
+
+        // [Metal EC] allocations must land on a buft that has Metal views, because EC-managed tensors are read by
+        // kernels and blits. The hook answers NULL for CUDA, so the stock path is unchanged there.
+        ggml_backend_ec_hooks * ec_buft = ggml_backend_ec_hooks_ptr;
+        if (ec_buft && ec_buft->active() && ec_buft->copy_buft) {
+            ggml_backend_buffer_type_t b2 = ec_buft->copy_buft(backends[b]);
+            if (b2 != NULL) {
+                sched->bufts[b] = b2;
+            }
+        }
+
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
         if (sched->n_copies > 1) {

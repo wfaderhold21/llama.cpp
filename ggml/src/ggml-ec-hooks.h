@@ -20,13 +20,64 @@
 
 typedef struct ggml_backend_ec_hooks {
     int (*active)(void);                    // registry enabled (LLAMA_EXPERT_CACHE > 0)
-    int (*is_cuda_buffer)(const ggml_tensor * t);  // tensor lives on a CUDA device buffer (cross-TU)
+    // [Metal port] generalized from is_cuda_buffer: the registering backend answers for ITS OWN
+    // device buffers. CUDA returns true for CUDA buffers, Metal for Metal buffers — semantics
+    // identical, just no longer CUDA-named. ggml-backend.cpp call sites use this name.
+    int (*is_gpu_buffer)(const ggml_tensor * t);  // tensor lives on the registering GPU backend's buffer (cross-TU)
+
+    // [disk source] disk(host) != 0 when this host expert tensor is registered as file-backed:
+    // its authoritative bytes are the GGUF range registered via ggml_backend_ec_set_file_source.
+    // Reads through host->data remain CORRECT (the tensor pages map the file, demand-faulted),
+    // but every hot-path fill must instead stream from the fd through pinned staging: bounded
+    // RSS is the product requirement on 24 GB unified-memory machines (page cache for 21 GB of
+    // experts is the jetsam class, not just an optimization).
+    int (*disk)(const ggml_tensor * host);
+    // legacy scheduler copy (ec_on==0 MoE branch): fill input_cpy slabs [first_id, last_id]
+    // from the file through staging, stream-ordered on the split backend like the stock
+    // set_async from host->data was.
+    void (*copy_slabs)(ggml_backend_t backend, ggml_tensor * dev, int32_t first_id, int32_t last_id);
+    // [Metal EC] bounded node-input allocation. For a decode-sized graph the scheduler creates this MoE
+    // weight's split-backend copy with ne[2] = C instead of n_expert, so that buffer IS the arena (C x slab)
+    // and the served path reads slots directly. Return 0 => full-size copy (CUDA keeps its current buffers).
+    int64_t (*bounded_ne2)(const ggml_tensor * node, const ggml_tensor * src, int64_t serve_max);
+    // [Metal EC] 1 when this host weight must get a real device-side copy instead of being read through the
+    // backend's mapped-buffer support. Without it the scheduler keeps the tensor on the CPU buffer, the served
+    // path never engages (it requires a GPU buffer), and the bounded arena is never used. NULL/0 => stock behavior.
+    // [gate75] node is passed so the hook can refuse copies for graphs that will never engage
+    // (prefill): forcing full-size expert copies onto the GPU for a CPU-served graph is the
+    // 13 GB wired killer. CUDA answers NULL (hook unused there).
+    int (*force_copy)(const ggml_tensor * node, const ggml_tensor * host);
+    // [Metal EC] buffer type the scheduler must use for this backend's graph allocations. EC-managed weights
+    // are read by kernels and blits, which cannot touch a mapped buft (no Metal views). Return NULL to keep the
+    // caller's buft — CUDA answers NULL, so its path is unchanged.
+    ggml_backend_buffer_type_t (*copy_buft)(ggml_backend_t backend);
+    // [Metal EC] 1 when this node must run on the GPU backend even though its weight operand is
+    // host-buffered. Pass 3 scores supported inputs and would pick CPU for an EC-managed MoE GEMM,
+    // which means no split copy and no served path. NULL/0 => stock behavior.
+    int (*assign_gpu)(const ggml_tensor * node);
 
     int (*setup)(ggml_backend_t backend, const ggml_tensor * host, ggml_tensor * dev, int64_t n_tokens, int64_t n_ids_elems);
     int (*lookup_or_evict)(const ggml_tensor * dev, int32_t id, int64_t * out_slot, int * out_need_copy);
     int (*copy_to_slot)(ggml_backend_t backend, const ggml_tensor * dev, int32_t id, int64_t slot);
     // map the n int32 routed ids of this call to slot indices and async-upload to device (ring)
     int (*fill_ids)(ggml_backend_t backend, const ggml_tensor * dev, const int32_t * host_ids, int n);
+    // [M6-RR] cache-conditioned routing (Strata STRATA_ROUTE_RESIDENT steal, MIT license).
+    // Scheduler (ggml-backend.cpp) drives these; NULL table entries leave legacy untouched.
+    // Ask whether non-resident id may take a tail slot: candidate = highest-prob expert that is
+    // resident AND un-picked this token (tok_row = that token's LIVE picked row); accepted when
+    // within margin of probs[id].
+    int (*swap_candidate)(const ggml_tensor * dev, int32_t id, const float * probs,
+                          const int32_t * tok_row, int n_used, int32_t * out_new);
+    // Snapshot + in-place edit + re-upload of the MUL weights operand (host F32 [1,ne,nt], ne =
+    // n_used per token, dense) for a swapped-token batch. ids_orig/ids_new are DENSE nt x ne.
+    // probs = selection probs the CPU get_rows read (row-major, stride probs_stride floats);
+    // the engine reproduces the graph's weight formula family (mode 0 raw | 1 raw/max(sum,
+    // 6.1035e-5) | 2 softmax; then *scale). w_cpy = the operand's split-backend copy to
+    // re-upload after the edit (may be NULL: MUL reads the host buffer directly).
+    int (*rr_apply)(ggml_backend_t backend, const ggml_tensor * dev, const float * probs,
+                    int64_t probs_stride, const int32_t * ids_orig, const int32_t * ids_new,
+                    int n_used, int nt, void * w_host, ggml_tensor * w_cpy, int mode, float scale);
+
 
     // called from ggml_cuda_mul_mat_id (CUDA module; kept uniform via the table anyway):
     int (*served_copy_phase)(const ggml_tensor * dev);  // decode call whose weights came from arena
@@ -41,6 +92,14 @@ typedef struct ggml_backend_ec_hooks {
     // [M3-C diag] optional GPU busy-time brackets around split compute (NULL = off)
     void (*gpu_begin)(ggml_backend_t backend);
     void (*gpu_end)(ggml_backend_t backend);
+
+    // [Metal EC / blocker B] accept node->src[0] == input (the ORIGINAL host tensor) for the MoE
+    // partial-copy branch. Stock test is node->src[0] == input_cpy, but sched split_graph never
+    // rewrites node->src[j], so a plain-CPU-buft weight whose copy lives on the GPU split never
+    // matches (moe_cpy_j=-1 forever). CUDA's host weights are backend-registered mirrors where the
+    // copies degenerate to the original, so CUDA never needed this — answer NULL there = stock test.
+    // Metal answers 1 only when the registry knows this tensor as EC-managed.
+    int (*moe_allow_orig_src)(const ggml_tensor * node, const ggml_tensor * input);
 } ggml_backend_ec_hooks;
 
 // defined in ggml-backend.cpp (NULL default => legacy path); set by CUDA backend init when the
@@ -86,7 +145,26 @@ extern std::atomic<uint64_t> g_ec_prof_cnt[GGML_EC_SITE_COUNT];
 
 // called by CUDA backend init when the registry is enabled
 void ggml_backend_ec_hooks_register(void);
+// called lazily from the Metal device registry when LLAMA_EXPERT_CACHE > 0 (default OFF: ptr NULL)
+void ggml_backend_ec_hooks_register_metal(void);
 GGML_BACKEND_API int ggml_cuda_ec_active(void);
 // element-count of the slot ids uploaded for this call's device tensor (0 if none) — used by the
 // mul_mat_id intercept to assert the upload matches the live ids tensor
 GGML_BACKEND_API int64_t ggml_cuda_ec_ids_n(const ggml_tensor * dev);
+
+// [Metal port] cross-TU accessors used by the ggml-metal.cpp MUL_MAT_ID intercept: the engine's
+// buffers (arena, ids ring) are Metal objects owned by ggml-metal-ec.mm. Same contract as the CUDA
+// arena + ids_slot: slot-indexed ids tensor layout; src0 points at the arena base and ids points
+// at this call's ring entry. NULL table => stock dispatch path, never called.
+GGML_BACKEND_API int  ggml_metal_ec_active(void);
+struct ggml_metal_ec_ref {
+    void * metal; // id<MTLBuffer> (opaque to C++ TUs)
+    size_t offs;
+};
+GGML_BACKEND_API struct ggml_metal_ec_ref ggml_metal_ec_arena_ref(const ggml_tensor * dev);
+GGML_BACKEND_API struct ggml_metal_ec_ref ggml_metal_ec_ids_ref  (const ggml_tensor * dev);
+GGML_BACKEND_API void ggml_metal_ec_count_intercept(void);
+GGML_BACKEND_API void ggml_metal_ec_count_decline(void);
+// [Metal EC] graph-compatibility refusal mirror: 1 when a graph contains an EC-engaged mul_mat_id
+// node — capture must not run for it (a captured blit bakes this call's slot map into every replay).
+GGML_BACKEND_API int ggml_metal_ec_graph_refused(struct ggml_cgraph * gf);

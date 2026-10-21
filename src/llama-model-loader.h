@@ -117,7 +117,15 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // [disk source] expert tensor byte ranges per file, collected at registration time; passed
+    // to llama_mmap like lazy.ranges (excluded from whole-file WILLNEED prefetch + MADV_RANDOM)
+    // but WITHOUT lazy tensor semantics — the EC engine serves these via pread on its own fd.
+    std::map<uint32_t, llama_mmap::ranges> ec_random;
+
     llama_files files;
+    // [disk source] parallel to files: the on-disk path per opened GGUF (empty for fd-embedded
+    // models). Needed to register expert tensor file sources for the expert-cache disk mode.
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 

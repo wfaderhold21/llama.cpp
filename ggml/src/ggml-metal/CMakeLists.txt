@@ -4,16 +4,30 @@ find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
 
 message(STATUS "Metal framework found")
 
+# [Metal EC] .mm sources need the OBJCXX language (project() only lists C/CXX); also required for
+# dispatch/dispatch.h + Metal framework usage in ggml-metal-ec.mm. Enable OBJC as well so existing
+# .m files stay pure ObjC (enabling OBJCXX alone re-maps .m to ObjC++ and breaks them). Must be
+# enabled BEFORE the target so .mm sources get the OBJCXX language.
+enable_language(OBJC)
+enable_language(OBJCXX)
+
 ggml_add_backend_library(ggml-metal
                          ggml-metal.cpp
                          ggml-metal-device.m
                          ggml-metal-device.cpp
                          ggml-metal-common.cpp
                          ggml-metal-context.m
+                         ggml-metal-ec.mm
                          ggml-metal-fusion.cpp
                          ggml-metal-ops.cpp
                          ggml-metal-tuning.cpp
                         )
+
+# [Metal EC] .mm sources need the OBJCXX language (project() only lists C/CXX); also required for
+# dispatch/dispatch.h + Metal framework usage in ggml-metal-ec.mm. Enable OBJC as well so existing
+# .m files stay pure ObjC (enabling OBJCXX alone re-maps .m to ObjC++ and breaks them).
+enable_language(OBJC)
+enable_language(OBJCXX)
 
 target_link_libraries(ggml-metal PRIVATE
                       ${FOUNDATION_LIBRARY}

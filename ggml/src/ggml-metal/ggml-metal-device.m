@@ -2178,6 +2178,9 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     ggml_metal_device_rsets_add(dev, res->rset);
 
     //ggml_metal_log_allocated_size(device, size_aligned);
+    if (size_aligned > 256ull << 20) {
+        fprintf(stderr, "[metal-alloc] shared=%d size=%.1fMB\n", (int) res->is_shared, size_aligned / 1048576.0);
+    }
 
     return res;
 }
@@ -2190,6 +2193,9 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     res->all_data = ptr;
     res->all_size = size;
 
+    if (size > 256ull << 20) {
+        fprintf(stderr, "[metal-map] mapped_view=%.1fMB max_tensor=%.1fMB\n", size / 1048576.0, max_tensor_size / 1048576.0);
+    }
     res->is_shared = true;
     res->owned = false;
 
@@ -2512,7 +2518,12 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
         }
     }
 
+    if (t->buffer) {
+        GGML_LOG_ERROR("%s: diag tensor=%s buft=%s usage=%d n_buffers=%d size=%zu\n", __func__, t->name,
+                ggml_backend_buft_name(t->buffer->buft), (int) t->buffer->usage, buf->n_buffers, ggml_backend_buffer_get_size(t->buffer));
+    } else {
+        GGML_LOG_ERROR("%s: diag tensor=%s no buffer\n", __func__, t->name);
+    }
     GGML_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
-
     return res;
 }

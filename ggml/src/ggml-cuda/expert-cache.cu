@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <vector>
 #include <chrono>
+#include <fcntl.h>    // [disk source] open
+#include <unistd.h>   // [disk source] pread
 
 #include "../ggml-ec-hooks.h"
 
@@ -29,6 +31,22 @@ static int ec_n_cached(void) {
 // [M2-lite] hit/miss counters — the design's core unknown is temporal locality of routing.
 static std::atomic<uint64_t> g_ec_hits{0}, g_ec_misses{0}, g_ec_evicts{0}, g_ec_calls{0};
 static std::atomic<uint64_t> g_ec_fallbacks{0};
+// [M4-PF] opportunistic prefetch diagnostics: copies issued / bytes / windows skipped (inflight gate).
+static std::atomic<uint64_t> g_pf_issued{0}, g_pf_bytes{0}, g_pf_skip{0};
+// [M5-BC] batched-copy diagnostics.
+static std::atomic<uint64_t> g_bc_batches{0}, g_bc_copies{0};
+    // [M6-RR] cache-conditioned routing (Strata STRATA_ROUTE_RESIDENT steal, MIT). Margin in
+    // SELECTION-PROB space (Nemotron gates with sigmoid): swap only when the router's own prob
+    // for the resident stand-in is within margin of the missed expert's prob.
+    static const float g_rr_margin = [] {
+        const char * v = getenv("LLAMA_EC_ROUTE_RESIDENT");
+        return v ? strtof(v, nullptr) : 0.0f;                    // 0 = off (ship default)
+    }();
+    static std::atomic<uint64_t> g_rr_offered{0}, g_rr_taken{0}, g_rr_applied{0};
+    static const bool g_rr_dbg = getenv("LLAMA_EC_RR_DEBUG") != nullptr;
+// [M5-BC] batched-copy A/B knob: default off (per-copy fork/join) until it wins an A/B.
+static const bool g_batchcopy_on = getenv("LLAMA_EC_BATCHCOPY") != nullptr;
+
 static std::atomic<uint64_t> g_ec_pinned_bytes{0};
 static std::atomic<uint64_t> g_ec_copy_bytes{0};
 static std::atomic<uint64_t> g_ec_copy_ns{0};
@@ -123,6 +141,16 @@ static void ec_gpu_reap(void) {
 
 static void ec_dump_names(void);  // fwd — needs g_entries, defined below
 
+// [steal P1, PolyStrata] usage-profile seed/save: an earlier run's routing counts, kept in a
+// file, seed this run's per-expert frequency counters — so hot-set preheat ranks experts from
+// real traffic BEFORE seeing any, exactly like PolyStrata's expert-profile.txt ("its profile is
+// a file of this install's own: it starts as the counts the repository ships" and the engine
+// "saves the experts' use after its first answer"). Counts keep accumulating during the run and
+// the file is rewritten at exit. Env: LLAMA_EC_PROFILE=<path>. atexit save only: kill -9 loses
+// the run's counts but never corrupts the file (temp+rename).
+static void ec_profile_seed(ggml_cuda_ec_entry & e, const char * path);
+static void ec_profile_save(const char * path);
+
 static void ec_atexit_dump(void) {
     // [M3-A] sync-site table (ggml-backend.cpp): where the host burns wall time per token
     static const char * site_name[GGML_EC_SITE_COUNT] = {
@@ -169,10 +197,25 @@ static void ec_atexit_dump(void) {
             (unsigned long long) g_a_cma.load(), (unsigned long long) g_a_cma_n.load(),
             (unsigned long long) g_a_swe.load(), (unsigned long long) g_a_swe_n.load(),
             (unsigned long long) g_a_evr.load(), (unsigned long long) g_a_evr_n.load());
+                printf("[expert-cache] route_resident margin=%.3f offered=%llu swapped=%llu applied=%llu\n",
+            g_rr_margin, (unsigned long long) g_rr_offered.load(),
+            (unsigned long long) g_rr_taken.load(), (unsigned long long) g_rr_applied.load());
+    printf("[expert-cache] batchcopy batches=%llu copies=%llu\n",
+            (unsigned long long) g_bc_batches.load(),
+            (unsigned long long) g_bc_copies.load());
+    printf("[expert-cache] prefetch issued=%llu bytes=%lluMB skipped_busy=%llu\n",
+            (unsigned long long) g_pf_issued.load(),
+            (unsigned long long) (g_pf_bytes.load() >> 20),
+            (unsigned long long) g_pf_skip.load());
     printf("[expert-cache] intercepts=%llu declines=%llu setups=%llu fillids=%llu gate_noserve=%llu graph_launches=%llu\n",
             (unsigned long long) g_ec_intercepts.load(), (unsigned long long) g_ec_declines.load(),
             (unsigned long long) g_ec_setups.load(), (unsigned long long) g_ec_fillids.load(),
             (unsigned long long) g_ec_gate_noserve.load(), (unsigned long long) g_ec_graph_launches.load());
+    // [steal P1] persist routing counts for the next run's warm-start (forward-declared above)
+    if (ec_n_cached() > 0) {
+        const char * pp = getenv("LLAMA_EC_PROFILE");
+        if (pp && *pp) ec_profile_save(pp);
+    }
 }
 
 static ggml_backend_ec_hooks g_hooks;
@@ -206,9 +249,73 @@ static void ec_dump_names(void) {
     }
     fflush(stdout);
 }
+
+// [steal P1, PolyStrata] profile file: one line per expert tensor —
+//   <tensor name>\t<n_expert>\t<count_0> <count_1> ...
+// Written temp+rename at exit; seed is best-effort (a missing/short/garbage line is skipped,
+// the run just learns its own hot set like before).
+static void ec_profile_seed(ggml_cuda_ec_entry & e, const char * path) {
+    if (!e.host_ptr || !e.host_ptr->name) return;
+    FILE * f = fopen(path, "r");
+    if (!f) return;
+    char * line = nullptr; size_t cap = 0;
+    while (getline(&line, &cap, f) != -1) {
+        char * tab1 = strchr(line, '\t');
+        if (!tab1) continue;
+        *tab1 = '\0';
+        if (strcmp(line, e.host_ptr->name) != 0) continue;
+        char * p = tab1 + 1;
+        long long n = strtoll(p, &p, 10);
+        if (n != (long long) e.n_expert || *p != '\t') continue;
+        p++;
+        int idx = 0;
+        while (idx < e.n_expert) {
+            char * endp = nullptr;
+            unsigned long long c = strtoull(p, &endp, 10);
+            if (endp == p) break;                        // malformed: keep what we seeded
+            e.freq[idx++] = c;
+            p = endp;
+            if (*p == ' ') p++;
+            else break;
+        }
+        if (idx == e.n_expert) {
+            fprintf(stderr, "[expert-cache] profile: seeded %lld freq counters from %s\n",
+                    (long long) e.n_expert, path);
+        }
+        break;
+    }
+    free(line); fclose(f);
+}
+
+static void ec_profile_save(const char * path) {
+    char tmp[4096];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int) getpid()) >= (int) sizeof(tmp)) return;
+    FILE * f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "EC-PROFILE v1\n");
+    for (auto & kv : g_entries) {
+        const ggml_cuda_ec_entry & e = kv.second;
+        if (!e.host_ptr || !e.host_ptr->name || e.freq.empty()) continue;
+        fprintf(f, "%s\t%lld\t", e.host_ptr->name, (long long) e.n_expert);
+        for (size_t i = 0; i < e.freq.size(); i++) fprintf(f, "%llu%c",
+                (unsigned long long) e.freq[i], i + 1 == e.freq.size() ? '\n' : ' ');
+    }
+    fclose(f);
+    if (rename(tmp, path) != 0) remove(tmp);
+}
 static std::unordered_map<const ggml_tensor *, ggml_cuda_ec_entry *> g_dev_idx;
 
-static int hook_is_cuda_buffer(const ggml_tensor * t) {
+// [disk source] true when the HOST expert tensor has a loader-registered GGUF range AND the
+// entry for it opened its fd + staging ring successfully. Consulted by the scheduler's legacy
+// copy branch (input tensor) — if the ring allocation failed we must NOT claim disk, or the
+// legacy path would leave stale slabs; the entry falls back to mapping reads at create time.
+static int hook_disk(const ggml_tensor * host) {
+    auto it = g_entries.find(host);
+    return (it != g_entries.end() && it->second.disk && it->second.fd >= 0 &&
+            it->second.dstage[0]) ? 1 : 0;
+}
+
+static int hook_is_gpu_buffer(const ggml_tensor * t) {
     // [M3-F perf] hot path (4x per MoE input x 48 layers x token): the buft->device walk is
     // pure-registry but repeated identically for the same buffer every call. Memoize on buffer
     // ptr (buffers outlive the sched for the model's life). Strata-style: ask once, cache plan.
@@ -229,7 +336,14 @@ ggml_cuda_ec_entry * ggml_cuda_ec_find(const ggml_tensor * dev) {
     return it == g_dev_idx.end() ? nullptr : it->second;
 }
 
-static ggml_cuda_ec_entry * lookup_or_create(const ggml_tensor * host, const ggml_tensor * dev) {
+static ggml_cuda_ec_entry * lookup_or_create(ggml_backend_t backend, const ggml_tensor * host, const ggml_tensor * dev) {
+    // [dual-GPU] sporc is a 4080 Super + 5060 Ti box: stream/event handles are per-device-context,
+    // and the sched thread's "current device" is not guaranteed to be the split backend's (crashed:
+    // cudaEventRecord invalid resource handle, current device 1 vs backend device 0). Pin the thread
+    // to the backend's device for the whole creation, record it, and re-pin in the copy helpers.
+    if (backend) {
+        ggml_cuda_set_device(((ggml_backend_cuda_context *) backend->context)->device);
+    }
     auto it = g_entries.find(host);
     if (it != g_entries.end()) {
         ggml_cuda_ec_entry * e = &it->second;
@@ -238,7 +352,7 @@ static ggml_cuda_ec_entry * lookup_or_create(const ggml_tensor * host, const ggm
         g_dev_idx[dev] = e;
         return e;
     }
-    GGML_ASSERT(host->buffer && !hook_is_cuda_buffer(host)); // entry mirrors HOST weights, not device
+    GGML_ASSERT(host->buffer && !hook_is_gpu_buffer(host)); // entry mirrors HOST weights, not device
 
     ggml_cuda_ec_entry e;
     e.host_ptr   = host;
@@ -247,6 +361,42 @@ static ggml_cuda_ec_entry * lookup_or_create(const ggml_tensor * host, const ggm
     e.slab       = host->nb[2];
     e.n_expert   = host->ne[2];
     e.C          = ec_n_cached();
+    if (backend) {
+        e.device = ((ggml_backend_cuda_context *) backend->context)->device;
+    }
+
+    // [disk source] if the loader registered this tensor's GGUF range (and disk source is on),
+    // open a private O_RDONLY fd and size the pinned staging ring. The mapping (host_base)
+    // remains a valid cold fallback — its pages demand-fault from the same file — but no hot
+    // path touches it, which is the bounded-RSS guarantee on unified-memory machines.
+    {
+        const char * src = getenv("LLAMA_EXPERT_CACHE_SOURCE");
+        const bool want_disk = src && strcmp(src, "disk") == 0;
+        ggml_ec_file_src fs;
+        if (want_disk && host->name && ggml_backend_ec_get_file_source(host->name, &fs)) {
+            int fd = ::open(fs.path, O_RDONLY);
+            if (fd < 0) {
+                fprintf(stderr, "[expert-cache] disk source: open(%s) failed -> mapping fallback for %s\n",
+                        fs.path, host->name);
+            } else {
+                e.disk      = true;
+                e.fd        = fd;
+                e.file_offs = fs.offs;
+                for (int i = 0; i < 4; i++) {
+                    if (cudaHostAlloc(&e.dstage[i], e.slab, cudaHostAllocDefault) != cudaSuccess) {
+                        e.dstage[i] = nullptr; // ring degrades: hook_copy_to_slot falls back
+                    } else {
+                        CUDA_CHECK(cudaEventCreateWithFlags(&e.dstage_done[i], cudaEventDisableTiming));
+                    }
+                }
+                static std::atomic<int> n_disk{0};
+                if (n_disk.fetch_add(1) == 0) {
+                    fprintf(stderr, "[expert-cache] disk source ACTIVE (pread %s @%llu, slab=%.1fMB)\n",
+                            fs.path, (unsigned long long) fs.offs, e.slab / 1e6);
+                }
+            }
+        }
+    }
     // [M3-G] full-residency override for chosen layers, e.g. LLAMA_EC_PIN_LAYERS=blk.52 pins the
     // whole MTP draft-head MoE (Ferrol: "I bet itd do well if it was [in VRAM]"). Arena grows to
     // n_expert * slab — check VRAM headroom (nextn up+down ~= 0.9 GB, well inside budget).
@@ -271,6 +421,10 @@ static ggml_cuda_ec_entry * lookup_or_create(const ggml_tensor * host, const ggm
     e.slots.assign(e.C, ggml_cuda_ec_slot{});
     e.slot_of_id.assign(e.n_expert, -1);
     e.freq.assign(e.n_expert, 0);
+    {   // [steal P1] seed freq from a previous run's saved profile (PolyStrata-style warm LRU)
+        const char * pp = getenv("LLAMA_EC_PROFILE");
+        if (pp && *pp) ec_profile_seed(e, pp);
+    }
     {   // [M3-E] when to prestage (decode calls per layer) and how much (MB of expert bytes)
         const char * genv = getenv("LLAMA_EC_PREHEAT_GEN");
         e.preheat_gen = genv ? strtoull(genv, nullptr, 10) : 48;
@@ -284,7 +438,9 @@ static ggml_cuda_ec_entry * lookup_or_create(const ggml_tensor * host, const ggm
     // hid the true steady-state cost, and idled the GPU during bench — the "low utilization".
     // NO_COPY already proved copies aren't the wall, so the mirror is OFF by default now
     // (miss copies read the GGUF mmap pages directly, ~13.7 GB/s pageable). Opt in: LLAMA_EC_PINNED_MIRROR=1.
-    if (getenv("LLAMA_EC_PINNED_MIRROR")) {
+    // [disk source] never mirror in disk mode: cudaHostAlloc(region) would materialize ALL experts
+    // in RAM (~21 GB) — the exact thing disk mode exists to prevent.
+    if (!e.disk && getenv("LLAMA_EC_PINNED_MIRROR")) {
         const size_t region = (size_t) e.n_expert * e.slab;
         char * mirror = nullptr;
         cudaError_t err = cudaHostAlloc((void **) &mirror, region, cudaHostAllocDefault);
@@ -310,7 +466,12 @@ static ggml_cuda_ec_entry * lookup_or_create(const ggml_tensor * host, const ggm
     // Fork ordering: a copy never overwrites a slot an enqueued GEMM may still be reading,
     // because the copy waits on an event recorded on the backend stream AT ISSUE TIME.
     CUDA_CHECK(cudaStreamCreateWithFlags(&e.copy_stream, cudaStreamNonBlocking));
+    if (getenv("LLAMA_EC_COPY_STREAMS") && strtoll(getenv("LLAMA_EC_COPY_STREAMS"), nullptr, 10) >= 2) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&e.copy_stream2, cudaStreamNonBlocking));  // [M5-CS]
+        CUDA_CHECK(cudaEventCreateWithFlags(&e.batch_join2, cudaEventDisableTiming));
+    }
     CUDA_CHECK(cudaEventCreateWithFlags(&e.fork_event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&e.batch_join, cudaEventDisableTiming));  // [M5-BC]
 
     auto res = g_entries.emplace(host, std::move(e));
     g_dev_idx[dev] = &res.first->second;
@@ -343,7 +504,7 @@ static int hook_setup(ggml_backend_t backend, const ggml_tensor * host, ggml_ten
     g_a_evq += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - tr0).count(); g_a_evq_n++;  // reap timer
     const auto tl0 = std::chrono::steady_clock::now();
-    ggml_cuda_ec_entry * e = lookup_or_create(host, dev);
+    ggml_cuda_ec_entry * e = lookup_or_create(backend, host, dev);
     g_a_cmb += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - tl0).count(); g_a_cmb_n++;  // lookup_or_create timer
     e->gen++;
@@ -356,6 +517,25 @@ static int hook_setup(ggml_backend_t backend, const ggml_tensor * host, ggml_ten
     // victims (observed: GGML_ASSERT(victim >= 0) abort at C=16 with SERVE_MAX=4 => 24 stamps).
     // Declining is safe and exact: engaged=0 -> no serve, legacy full-slab path (stock behavior).
     e->engaged   = (n_tokens <= 8 && e->C >= n_ids_elems) ? 1 : 0;
+    // [M5-BC] open the copy-batch window HERE: the authoritative miss copies are issued by the
+    // ggml-backend.cpp prefetch-hint loop between setup() and fill_ids() (copy_to_slot), NOT by
+    // fill_ids own miss loop — opening at fill_ids meant the window never covered a real copy
+    // (batches=0 on the first A/B). Closed + joined at fill_ids end. Decline paths leave the
+    // window open harmlessly: join-waits on an un-recorded batch_join complete immediately and
+    // the next setup re-opens; stale loading slots still join via the per-slot fallback loop.
+    e->in_batch     = g_batchcopy_on;
+    e->batch_slots.clear();
+    // [M6-RR] per-call rr bookkeeping + capture probe: never swap while the stream is
+    // capturing (a captured copy would BAKE swapped bytes into every replay).
+    e->rr_applied   = false;
+    e->rr_w_host    = nullptr;
+    e->rr_w_cpy     = nullptr;
+    e->rr_w_bytes   = 0;
+    {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream_for(backend), &cap);
+        e->rr_capturing = (cap != cudaStreamCaptureStatusNone);
+    }
     e->last_ids  = nullptr;
     e->last_ids_n = 0;
     (void) backend;
@@ -423,10 +603,9 @@ static int hook_lookup_or_evict(const ggml_tensor * dev, int32_t id, int64_t * o
     return 1;
 }
 
-static int hook_copy_to_slot(ggml_backend_t backend, const ggml_tensor * dev, int32_t id, int64_t slot) {
-    ggml_cuda_ec_entry * e = ggml_cuda_ec_find(dev);
+static int ec_copy_to_slot_impl(ggml_cuda_ec_entry * e, int32_t id, int64_t slot, cudaStream_t kstream) {
     GGML_ASSERT(e && e->host_base && slot >= 0 && slot < e->C);
-    cudaStream_t kstream = stream_for(backend);
+    ggml_cuda_set_device(e->device);  // [dual-GPU] stream/event handles belong to this device
     const uint8_t * src = (const uint8_t *) (e->pinned ? e->pinned : e->host_base) + (size_t) id * e->slab;
     uint8_t * dst = e->arena + (size_t) slot * e->slab;
     const auto t0 = std::chrono::steady_clock::now();
@@ -439,11 +618,54 @@ static int hook_copy_to_slot(ggml_backend_t backend, const ggml_tensor * dev, in
     // return "completed" immediately, so the probe is self-consistent.
     static const bool no_copy = getenv("LLAMA_EC_NO_COPY") != nullptr;
     ggml_cuda_ec_slot & sl = e->slots[slot];
-    if (no_copy) {
+if (no_copy) {
         sl.loading = false;
         g_ec_copy_bytes += 0; // deliberately not counted
         return 1;
     }
+    // [disk source] miss fill from the GGUF: pread slab into the next free pinned staging slot
+    // (host blocks only on the NVMe read itself, ~2-4 ms at slab=3.7MB), then true async DMA on
+    // the copy stream. Staging ring is 4-deep; reuse gated on the recorded DMA-completion event.
+    // Mapping pages are never faulted, so expert RSS stays ~0 — the Mac requirement.
+    if (e->disk && e->fd >= 0) {
+        int s = e->dstage_next;
+        while (e->dstage_done[s] && cudaEventQuery(e->dstage_done[s]) == cudaErrorNotReady) {
+            s = (s + 1) & 3;
+            if (s == e->dstage_next) {
+                // ring fully in flight: oldest is guaranteed to finish; bounded wait, no busy-spin
+                if (e->dstage_done[s]) CUDA_CHECK(cudaEventSynchronize(e->dstage_done[s]));
+                break;
+            }
+        }
+        e->dstage_next = (s + 1) & 3;
+        void * stage = e->dstage[s];
+        if (!stage) goto mapping_fallback;  // staging cudaHostAlloc failed at create: slow-but-correct
+        {
+            const ssize_t got = ::pread(e->fd, stage, e->slab,
+                                        (off_t) (e->file_offs + (uint64_t) id * e->slab));
+            if (got != (ssize_t) e->slab) {
+                fprintf(stderr, "[expert-cache] disk pread short (%zd/%zu) id=%d -> mapping fallback\n",
+                        got, e->slab, id);
+                goto mapping_fallback;
+            }
+        }
+        CUDA_CHECK(cudaEventRecord(e->fork_event, kstream));
+        CUDA_CHECK(cudaStreamWaitEvent(e->copy_stream, e->fork_event, 0));
+        CUDA_CHECK(cudaMemcpyAsync(dst, stage, e->slab, cudaMemcpyHostToDevice, e->copy_stream));
+        if (!sl.in_flight) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&sl.in_flight, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(sl.in_flight, e->copy_stream));
+        if (e->dstage_done[s]) CUDA_CHECK(cudaEventRecord(e->dstage_done[s], e->copy_stream));
+        sl.loading = true;
+        e->side_copies++;
+        e->side_bytes += e->slab;
+        g_ec_copy_bytes += e->slab;
+        g_ec_copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        return 1;
+    }
+mapping_fallback:;
     // [M3-F] Without the pinned mirror the copy SOURCE is GGUF mmap pages: cudaMemcpyAsync from
     // pageable/file-backed memory is host-blocking (~13.7 GB/s, 512MB of it per token) — putting
     // it on a side stream buys nothing (measured wash) and its fork/join events add driver traffic.
@@ -457,13 +679,37 @@ static int hook_copy_to_slot(ggml_backend_t backend, const ggml_tensor * dev, in
         // [M3-B] fork: the slot may still be read by GEMMs enqueued on the kernel stream (any call
         // that routed to the previous occupant). Wait on an event recorded NOW on that stream before
         // overwriting. join (fill_ids) makes the kernel stream wait on the copy before the next read.
-        CUDA_CHECK(cudaEventRecord(e->fork_event, kstream));
-        CUDA_CHECK(cudaStreamWaitEvent(e->copy_stream, e->fork_event, 0));
-        CUDA_CHECK(cudaMemcpyAsync(dst, src, e->slab, cudaMemcpyHostToDevice, e->copy_stream));
-        if (!sl.in_flight) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&sl.in_flight, cudaEventDisableTiming));
+        // [M5-BC] LLAMA_EC_BATCHCOPY=1: inside a fill_ids batch window the fork is taken ONCE
+        // (first copy of the window) and the join is a single shared event recorded at window
+        // end - host API cost amortized across the batch instead of 4+ calls per copy.
+        if (g_batchcopy_on && e->in_batch) {
+            if (e->batch_slots.empty()) {
+                CUDA_CHECK(cudaEventRecord(e->fork_event, kstream));
+                CUDA_CHECK(cudaStreamWaitEvent(e->copy_stream, e->fork_event, 0));
+                if (e->copy_stream2) CUDA_CHECK(cudaStreamWaitEvent(e->copy_stream2, e->fork_event, 0));
+                g_bc_batches++;
+            }
+            // [M5-CS] stream affinity: slots that already copied keep their stream (same-stream
+            // ordering makes overwriting an in-flight copy safe); new slots split round-robin.
+            if (!sl.cs && e->copy_stream2 && (e->cs_rr++ & 1)) sl.cs = 1;
+            cudaStream_t cs_stream = (sl.cs && e->copy_stream2) ? e->copy_stream2 : e->copy_stream;
+            CUDA_CHECK(cudaMemcpyAsync(dst, src, e->slab, cudaMemcpyHostToDevice, cs_stream));
+            sl.in_flight = sl.cs ? e->batch_join2 : e->batch_join;  // shared join per stream
+            sl.loading   = true;
+            e->batch_slots.push_back(slot);
+            g_bc_copies++;
+        } else {
+            CUDA_CHECK(cudaEventRecord(e->fork_event, kstream));
+            CUDA_CHECK(cudaStreamWaitEvent(e->copy_stream, e->fork_event, 0));
+            if (!sl.cs && e->copy_stream2 && (e->cs_rr++ & 1)) sl.cs = 1;  // [M5-CS] affinity
+            cudaStream_t cs_stream = (sl.cs && e->copy_stream2) ? e->copy_stream2 : e->copy_stream;
+            CUDA_CHECK(cudaStreamWaitEvent(cs_stream, e->fork_event, 0));
+            CUDA_CHECK(cudaMemcpyAsync(dst, src, e->slab, cudaMemcpyHostToDevice, cs_stream));
+            if (!sl.in_flight) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&sl.in_flight, cudaEventDisableTiming));
+            }
+            CUDA_CHECK(cudaEventRecord(sl.in_flight, cs_stream));
         }
-        CUDA_CHECK(cudaEventRecord(sl.in_flight, e->copy_stream));
         sl.loading = true; // cleared when fill_ids joins the kernel stream onto this slot
         e->side_copies++;
         e->side_bytes += e->slab;
@@ -472,6 +718,57 @@ static int hook_copy_to_slot(ggml_backend_t backend, const ggml_tensor * dev, in
     g_ec_copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - t0).count();
     return 1;
+}
+
+static int hook_copy_to_slot(ggml_backend_t backend, const ggml_tensor * dev, int32_t id, int64_t slot) {
+    ggml_cuda_ec_entry * e = ggml_cuda_ec_find(dev);
+    if (!e) return 0;
+    return ec_copy_to_slot_impl(e, id, slot, stream_for(backend));
+}
+
+// [disk source] shared body for scheduler-legacy fills: stream input_cpy slabs [first_id,
+// last_id] from the GGUF through the pinned staging ring onto kstream. Same ordering contract
+// as the stock set_async-from-host it replaces (see hook_copy_slabs comment).
+static void ec_fill_dev_slabs(ggml_cuda_ec_entry * e, const ggml_tensor * dev,
+                              int32_t first_id, int32_t last_id, cudaStream_t kstream) {
+    ggml_cuda_set_device(e->device);  // [dual-GPU] staging_done[] events belong to this device
+    uint8_t * dst = (uint8_t *) dev->data;
+    for (int32_t id = first_id; id <= last_id; id++) {
+        int s = e->dstage_next;
+        while (e->dstage_done[s] && cudaEventQuery(e->dstage_done[s]) == cudaErrorNotReady) {
+            s = (s + 1) & 3;
+            if (s == e->dstage_next) {
+                if (e->dstage_done[s]) CUDA_CHECK(cudaEventSynchronize(e->dstage_done[s]));
+                break;
+            }
+        }
+        e->dstage_next = (s + 1) & 3;
+        void * stage = e->dstage[s];
+        if (!stage) continue;  // staging cudaHostAlloc failed at create: log-once happened there;
+                               // stale slab here would be data corruption -> caller declines instead
+                               // (hook_disk() returns false when staging ring is empty)
+        const ssize_t got = ::pread(e->fd, stage, e->slab,
+                                    (off_t) (e->file_offs + (uint64_t) id * e->slab));
+        if (got != (ssize_t) e->slab) { continue; }  // short read: same policy (unreachable in practice)
+        CUDA_CHECK(cudaMemcpyAsync(dst + (size_t) id * e->slab, stage, e->slab,
+                                   cudaMemcpyHostToDevice, kstream));
+        if (e->dstage_done[s]) CUDA_CHECK(cudaEventRecord(e->dstage_done[s], kstream));
+    }
+}
+
+// [disk source] scheduler legacy-copy replacement (ec_on==0 MoE branch, ggml-backend.cpp):
+// fill input_cpy slab [id] from the GGUF. Must obey the SAME ordering contract the stock
+// set_async-from-host had: enqueued on the split backend's kernel stream so later GEMM reads
+// are stream-ordered behind it — do NOT route through the arena side-stream (nothing would
+// join it for this tensor; the arena path's join lives in fill_ids, which the legacy branch
+// never calls). Pinned staging keeps the DMA truly async; ring slot reuse is gated on the
+// event recorded after its enqueue on this same stream.
+static void hook_copy_slabs(ggml_backend_t backend, ggml_tensor * dev, int32_t first_id, int32_t last_id) {
+    ggml_cuda_ec_entry * e = ggml_cuda_ec_find(dev);
+    if (!e || !e->disk || e->fd < 0) {
+        return;  // defensive: caller only routes here when disk(host) said yes
+    }
+    ec_fill_dev_slabs(e, dev, first_id, last_id, stream_for(backend));
 }
 
 static void ec_preheat(ggml_backend_t backend, ggml_cuda_ec_entry * e) {
@@ -510,6 +807,8 @@ static void ec_preheat(ggml_backend_t backend, ggml_cuda_ec_entry * e) {
             (long long) k, e->slab / 1e6, (unsigned long long) e->preheat_copied,
             (unsigned long long) e->gen);
 }
+
+static void ec_prefetch_run(struct ggml_cuda_ec_entry * e, cudaStream_t kstream);
 
 static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const int32_t * host_ids, int n) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -598,10 +897,24 @@ static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const 
     // [M3-B] join: the kernel stream must not read any slot whose side-stream copy is still
     // loading — including slots that HIT this call but were mid-fill from an earlier miss.
     // Event-waits are GPU-side; the host never blocks. Dedupe: one wait per repeated slot.
+    const bool bc_used = e->in_batch && !e->batch_slots.empty();  // [M5-BC]
+    if (bc_used) {
+        bool has1 = false;                                        // [M5-CS] any copy on stream 2?
+        for (int64_t bs : e->batch_slots) if (e->slots[bs].cs) { has1 = true; break; }
+        CUDA_CHECK(cudaEventRecord(e->batch_join, e->copy_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream_for(backend), e->batch_join, 0));
+        if (has1) {
+            CUDA_CHECK(cudaEventRecord(e->batch_join2, e->copy_stream2));
+            CUDA_CHECK(cudaStreamWaitEvent(stream_for(backend), e->batch_join2, 0));
+        }
+        for (int64_t bs : e->batch_slots) e->slots[bs].loading = false;
+    }
+    e->in_batch = false;
     for (int i = 0; i < n; i++) {
         const int32_t s = stage[i];
         ggml_cuda_ec_slot & sl = e->slots[s];
         if (!sl.loading || !sl.in_flight) continue;
+        if (bc_used && (sl.in_flight == e->batch_join || sl.in_flight == e->batch_join2)) continue;
         bool dup = false;
         for (int j = 0; j < i && !dup; j++) dup = (stage[j] == s);
         if (dup) continue;
@@ -647,11 +960,190 @@ static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const 
     }
     e->last_ids   = dst_dev;
     e->last_ids_n = n;
+    // [M6-RR] per-token served proof: fill_ids accepting exactly ids_expect slot ids means the
+    // ring the (captured or live) mmvq reads is valid THIS token. hook_engaged only runs at graph
+    // CAPTURE time, so under replay it can never be the gate.
+    if (e->ids_expect == 0 || (int64_t) n == e->ids_expect) e->n_served++;
     g_ec_fillids++;
+    // [M4-PF] opportunistic prefetch after the join (host-side only; capture legality handled
+    // inside via event-query pressure gate — cudaEventQuery IS legal mid-capture? NO: guard).
+    if (cap_stage == cudaStreamCaptureStatusNone) {
+        ec_prefetch_run(e, stream_for(backend));
+    }
     return 1;
 }
 
-// --- hooks called from the ggml-cuda.cu mul_mat_id intercept ---
+// [M4-PF] opportunistic prefetch (end of fill_ids, windowed). Roofline: LLAMA_EC_NO_COPY probe =
+// 119.7 t/s vs 71.5 real (Oct 19) -> decode is copy-bound and the DMA copy engines sit below
+// line rate. Rank this entry's NON-resident experts by routing frequency (freq window closes
+// early = steady routing distribution; preheat already pinned the hottest ~K — prefetch targets
+// the tail) and copy them into arena slots on copy_stream under the SAME reservation rules a
+// real miss uses (empty > settled-LRU > hot/inflight fallback), with two deltas:
+//   - never steal a slot stamped THIS call (its GEMM launch reads it);
+//   - never stamp our own copy afterwards: a same-token reader is legal via fork/join ordering,
+//     and leaving it unstamped keeps the slot evictable if the copy is slow to land.
+// Claim (slot_of_id + loading) is set AT ISSUE so a real miss on that id resolves as a hit and
+// fill_ids' join waits on the slot's in_flight event. Capture-unsafe APIs avoided; window rate
+// + inflight-pressure gate bound host issue cost. Env LLAMA_EC_PREFETCH=<gens-per-window>, 0=off.
+#define EC_PF_COPIES 8
+static void ec_prefetch_run(ggml_cuda_ec_entry * e, cudaStream_t kstream) {
+    static const long long pf_rate = [] {
+        const char * v = getenv("LLAMA_EC_PREFETCH");
+        return v ? strtoll(v, nullptr, 10) : 0LL;
+    }();
+    if (pf_rate <= 0 || e->C <= 0 || e->n_expert <= 0) return;
+    if (e->gen < 64 || (long long) (e->gen % (uint64_t) pf_rate) != 0) return;
+    ggml_cuda_set_device(e->device);
+    // Skip the window if EC_PF_COPIES copies are already loading (a cudaStreamQuery gate
+    // starved v1: the copy stream is never idle at decode speed).
+    {
+        int inflight = 0;
+        for (int64_t s0 = 0; s0 < e->C; s0++) {
+            const ggml_cuda_ec_slot & cand = e->slots[s0];
+            if (cand.loading && cand.in_flight &&
+                cudaEventQuery(cand.in_flight) == cudaErrorNotReady && ++inflight >= EC_PF_COPIES) {
+                g_pf_skip++;
+                return;
+            }
+        }
+    }
+    std::vector<int32_t> order;
+    order.reserve((size_t) e->n_expert);
+    for (int32_t i = 0; i < (int32_t) e->n_expert; i++) {
+        if (e->slot_of_id[i] < 0) order.push_back(i);
+    }
+    const std::vector<uint64_t> & f = e->freq;
+    std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return f[a] > f[b]; });
+    int64_t budget = EC_PF_COPIES;
+    for (size_t oi = 0; oi < order.size() && budget > 0; oi++) {
+        const int32_t id = order[oi];
+        if (f[id] == 0) break;                                   // no routing evidence: stop
+        // victim: empty > LRU-oldest unstamped > LRU-oldest (hot/inflight last) — mirrors
+        // lookup_or_evict, never touching slots stamped this call.
+        int64_t slot = -1;
+        for (int pass = 0; pass < 3 && slot < 0; pass++) {
+            uint64_t oldest = UINT64_MAX;
+            for (int64_t s0 = 0; s0 < e->C; s0++) {
+                const ggml_cuda_ec_slot & cand = e->slots[s0];
+                if (cand.stamp_gen == e->gen) continue;           // read by this call — untouchable
+                if (cand.hot && pass == 0) continue;              // keep hot while cold victims exist
+                const bool inflight = cand.in_flight && cudaEventQuery(cand.in_flight) == cudaErrorNotReady;
+                if (inflight && pass < 2 && oldest != UINT64_MAX) continue;
+                if (cand.expert_id < 0) { slot = s0; break; }
+                if (cand.last_use < oldest) { oldest = cand.last_use; slot = s0; }
+            }
+        }
+        if (slot < 0) break;                                     // nothing stealable: stop window
+        ggml_cuda_ec_slot & sl = e->slots[slot];
+        if (sl.expert_id >= 0) e->slot_of_id[sl.expert_id] = -1; // unbind the victim's occupant
+        sl.expert_id = id;                                       // claim BEFORE the copy issues
+        sl.last_use  = e->gen;
+        sl.hot       = false;
+        e->slot_of_id[id] = slot;                                // misses on this id now HIT + join
+        ec_copy_to_slot_impl(e, id, slot, kstream);              // fork/join-ordered side-stream DMA
+        sl.loading   = true;                                     // cleared by the join in fill_ids
+        g_pf_issued++; g_pf_bytes += e->slab;
+        budget--;
+    }
+}
+
+
+    // --- [M6-RR] cache-conditioned routing hooks (scheduler call sites in ggml-backend.cpp) ---
+    static int hook_swap_candidate(const ggml_tensor * dev, int32_t id, const float * probs,
+                                   const int32_t * tok_row, int n_used, int32_t * out_new) {
+        *out_new = -1;
+        if (g_rr_margin <= 0.0f || !probs || !tok_row || n_used <= 0) return 0;
+        const ggml_cuda_ec_entry * e = ggml_cuda_ec_find(dev);
+        if (!e || !e->engaged || e->C <= 0 || e->n_expert <= 0 || e->n_served == 0 || e->rr_capturing) return 0;
+        if (id < 0 || id >= (int32_t) e->n_expert) return 0;
+        if (e->slot_of_id[id] >= 0) return 0;                         // resident: nothing to win
+        g_rr_offered++;
+        const float p_id = probs[id];
+        int32_t best = -1; float best_p = -1.0f;
+        for (int32_t f = 0; f < (int32_t) e->n_expert; f++) {
+            if (e->slot_of_id[f] < 0) continue;                       // must be resident
+            bool used = false;                                        // must be un-picked this token
+            for (int q = 0; q < n_used; q++) used |= (tok_row[q] == f);
+            if (used) continue;
+            const float pf = probs[f];
+            if (pf > best_p) { best_p = pf; best = f; }
+        }
+        if (best >= 0 && (double) p_id - (double) best_p <= (double) g_rr_margin) {
+            *out_new = best; g_rr_taken++;
+            if (g_rr_dbg && g_rr_taken.load() <= 20) {
+                fprintf(stderr, "[ec-rr] %s id=%d(p=%.4f) -> %d(p=%.4f) gap=%.4f\n",
+                        ggml_get_name(e->host_ptr), id, p_id, best, best_p, (double) p_id - best_p);
+            }
+            return 1;
+        }
+        return 0;
+    }
+
+    // Snapshot the operand, edit swapped token rows in place from the selection probs, and
+    // RE-UPLOAD to the split copy with a fresh async copy enqueued here: stream-ordered after
+    // every input copy enqueued so far and before compute, so the device operand ends up
+    // carrying the edited bytes whether the scheduler's own copy already fired, fires later
+    // from the edited buffer, or was baked at capture (graphs replay). Snapshot powers the
+    // fallback_full restore.
+    static int hook_rr_apply(ggml_backend_t backend, const ggml_tensor * dev, const float * probs,
+                             int64_t probs_stride, const int32_t * ids_orig, const int32_t * ids_new,
+                             int n_used, int nt, void * w_host, ggml_tensor * w_cpy, int mode, float scale) {
+        if (!probs || !ids_orig || !ids_new || !w_host || n_used <= 0 || n_used > 64 ||
+            nt <= 0 || nt > 8 || probs_stride <= 0) return 0;
+        ggml_cuda_ec_entry * e = ggml_cuda_ec_find(dev);
+        if (!e || e->rr_capturing) return 0;
+        const int nu = n_used;
+        const size_t bytes = (size_t) n_used * (size_t) nt * sizeof(float);   // w [1,ne,nt] contig
+        // validate ALL new ids BEFORE any edit lands (fail closed, buffer untouched)
+        int ndiff = 0;
+        for (int t = 0; t < nt; t++)
+            for (int r = 0; r < nu; r++) {
+                const int32_t id = ids_new[(size_t) t * n_used + r];
+                if (id < 0 || id >= (int32_t) e->n_expert) return 0;
+                ndiff += (ids_orig[(size_t) t * n_used + r] != id);
+            }
+        if (!ndiff) return 0;
+        e->rr_w_snap.resize(bytes / sizeof(float));
+        memcpy(e->rr_w_snap.data(), w_host, bytes);
+        e->rr_w_host  = w_host;
+        e->rr_w_cpy   = w_cpy;
+        e->rr_w_bytes = bytes;
+        for (int t = 0; t < nt; t++) {
+            bool dif = false;
+            for (int r = 0; r < nu; r++) dif |= (ids_orig[(size_t) t * n_used + r] != ids_new[(size_t) t * n_used + r]);
+            if (!dif) continue;                                     // untouched rows stay byte-original
+            float * row = (float *) w_host + (size_t) t * (size_t) n_used;
+            double raw[64];
+            for (int r = 0; r < nu; r++) {
+                const int32_t id = ids_new[(size_t) t * n_used + r];
+                raw[r] = (double) probs[(size_t) t * (size_t) probs_stride + (size_t) id];
+            }
+            if (mode == 1) {
+                float den = 0.0f;
+                for (int r = 0; r < nu; r++) den += (float) raw[r];
+                if (den < 6.103515625e-5f) den = 6.103515625e-5f;   // ffn_moe_weights_sum_clamp
+                for (int r = 0; r < nu; r++) row[r] = (float) ((double) (float) raw[r] / (double) den) * scale;
+            } else if (mode == 2) {
+                double mx = 0.0, ex[64], den = 0.0;
+                for (int r = 0; r < nu; r++) if (raw[r] > mx) mx = raw[r];
+                for (int r = 0; r < nu; r++) { ex[r] = exp(raw[r] - mx); den += ex[r]; }
+                if (!(den > 0.0)) den = 1.0;
+                for (int r = 0; r < nu; r++) row[r] = (float) (ex[r] / den) * scale;
+            } else {
+                for (int r = 0; r < nu; r++) row[r] = (float) raw[r] * scale;
+            }
+        }
+        // belt: fresh copy of the edited operand to the split copy (NULL operand copy = MUL
+        // reads the host buffer directly — the scheduler's own copy reads edited bytes anyway).
+        if (w_cpy) {
+            CUDA_CHECK(cudaMemcpyAsync(w_cpy->data, w_host, bytes, cudaMemcpyHostToDevice, stream_for(backend)));
+        }
+        g_rr_applied++;
+        e->rr_applied = true;
+        return 1;
+    }
+
+    // --- hooks called from the ggml-cuda.cu mul_mat_id intercept ---
 
 static int hook_served(const ggml_tensor * dev) {
     // true when the copy phase touched input_cpy for this call: if we then fail to intercept,
@@ -661,7 +1153,7 @@ static int hook_served(const ggml_tensor * dev) {
 }
 
 static int hook_engaged(const ggml_tensor * dev) {
-    const ggml_cuda_ec_entry * e = ggml_cuda_ec_find(dev);
+    ggml_cuda_ec_entry * e = ggml_cuda_ec_find(dev);  // [M6-RR] non-const: n_served++
     if (!e || !e->engaged || !e->last_ids) {
         static int logged = 0;
         if (logged < 3) {
@@ -674,7 +1166,9 @@ static int hook_engaged(const ggml_tensor * dev) {
     }
     // the upload must match the ids tensor the kernel is about to read; any mismatch -> decline
     // the cache path (stay on legacy = correct, just slower)
-    return (e->ids_expect == 0 || e->last_ids_n == e->ids_expect) ? 1 : 0;
+    const bool rr_served = (e->ids_expect == 0 || e->last_ids_n == e->ids_expect);
+    if (rr_served) e->n_served++;   // [M6-RR] prove-the-shape-serves gate for route-resident
+    return rr_served ? 1 : 0;
 }
 
 static int64_t hook_slots(const ggml_tensor * dev) {
@@ -718,6 +1212,31 @@ static void hook_fallback_full(const ggml_tensor * dev, void * stream_v) {
     // Sync the stream FIRST: the M3-A ev_wait skip assumes no legacy write to input_cpy is ever
     // in flight while the served path is engaged; this path is the exception that proves it.
     g_ec_fallbacks++;
+    // [M6-RR] the intercept declined a call we swapped weights for: legacy reads the ORIGINAL
+    // device ids, so the operand must go byte-original too — restore host buffer from snapshot
+    // and re-upload ahead of the refill below (the syncs/streams below still order it pre-GEMM).
+    if (e->rr_applied && e->rr_w_host && !e->rr_w_snap.empty()) {
+        memcpy(e->rr_w_host, e->rr_w_snap.data(), e->rr_w_bytes);
+        if (e->rr_w_cpy && e->rr_w_cpy->data) {
+            cudaMemcpyAsync(e->rr_w_cpy->data, e->rr_w_host, e->rr_w_bytes,
+                            cudaMemcpyHostToDevice, (cudaStream_t) stream_v);
+        }
+        e->rr_applied = false;
+    }
+    // [disk source] refill input_cpy (dev_ptr) from the GGUF via the staging ring on the
+    // caller's stream — same target the stock full memcpy below writes, so the legacy GEMM
+    // reads a fully-populated tensor; mapping pages stay unfaulted.
+    if (e->disk && e->fd >= 0) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing((cudaStream_t) stream_v, &cap);
+        if (cap != cudaStreamCaptureStatusNone) {
+            return; // capture-time full refill on disk source: not shippable; callers must decline
+        }
+        CUDA_CHECK(cudaStreamSynchronize((cudaStream_t) stream_v));
+        ec_fill_dev_slabs(e, e->dev_ptr, 0, (int32_t) e->n_expert - 1, (cudaStream_t) stream_v);
+        CUDA_CHECK(cudaStreamSynchronize((cudaStream_t) stream_v));
+        return;
+    }
     // [M3-D] during CUDA graph capture (EC graphs mode) syncs are illegal — record the refill
     // memcpy only. Nothing can be in flight on the capturing stream, and weights are static,
     // so the recorded node is correct at every replay.
@@ -748,7 +1267,9 @@ void ggml_backend_ec_hooks_register(void) {
     atexit(ec_atexit_dump);
 
     g_hooks.active            = hook_active;
-    g_hooks.is_cuda_buffer    = hook_is_cuda_buffer;
+    g_hooks.is_gpu_buffer     = hook_is_gpu_buffer;
+    g_hooks.disk              = hook_disk;
+    g_hooks.copy_slabs        = hook_copy_slabs;
     g_hooks.setup             = hook_setup;
     g_hooks.lookup_or_evict   = hook_lookup_or_evict;
     g_hooks.copy_to_slot      = hook_copy_to_slot;
@@ -759,6 +1280,8 @@ void ggml_backend_ec_hooks_register(void) {
     g_hooks.arena             = hook_arena;
     g_hooks.ids_slot          = hook_ids_slot;
     g_hooks.fallback_full     = hook_fallback_full;
+    g_hooks.swap_candidate    = hook_swap_candidate;                       // [M6-RR]
+    g_hooks.rr_apply          = hook_rr_apply;                             // [M6-RR]
     // [M3-C diag] gpu-bracket hooks left OFF: cudaEventRecord/Query in the split loop turned
     // into sticky CUDA errors surfacing later in quantize_row_q8_1 (unroot-caused; NO_COPY
     // roofline probe answers the same question from the other side — see hook_copy_to_slot).

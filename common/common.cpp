@@ -1665,6 +1665,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         // ggml_backend_ec_hooks_register() picks it up at CUDA device init.
         setenv("LLAMA_EXPERT_CACHE", std::to_string(params.expert_cache).c_str(), 1);
         setenv("LLAMA_EXPERT_CACHE_POLICY", params.expert_cache_policy.c_str(), 1);
+        // [disk source] read LAZILY by the copy engines (same late-setenv lesson as above):
+        // host = pinned RAM mirror | disk = pread from the GGUF through pinned staging.
+        setenv("LLAMA_EXPERT_CACHE_SOURCE", params.expert_cache_source.c_str(), 1);
         // the slot cache is eager-only in M2 (per-call id uploads + copy-phase memcpys are not
         // graph-expressible yet); common.cuh reads this switch for CUDA graph capture
         setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);

@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-metal-impl.h"
@@ -9,6 +10,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-tuning.h"
+#include "../ggml-ec-hooks.h"   // [Metal EC] hook table only — no ObjC types in this TU
 
 #include <cassert>
 #include <algorithm>
@@ -22,8 +24,34 @@ static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
 
     ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
 
-    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t) buffer->context;
+    // a multi-buffer has no backing view of its own; resolve the sub-buffer that holds this tensor
+    if (ggml_backend_buffer_is_multi_buffer(buffer)) {
+        buffer = ggml_backend_multi_buffer_get_sub_buffer(buffer, t->data);
+        if (buffer == NULL) {
+            return { nullptr, 0 };
+        }
+    }
 
+    // [Metal EC] a host buffer has no Metal view; during EC runs create one lazily for activations
+    if (ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer))) {
+        void * view = ggml_metal_ec_host_view(t);
+        if (view != nullptr) {
+            return { view, (size_t) ((char *) t->data - (char *) ggml_backend_buffer_get_base(buffer)) };
+        }
+        // view declined (oversized whole-file mapping, or EC off): return nil instead of casting a
+        // CPU buffer context to ggml_metal_buffer_t — that garbage cast is the gate65-73 segfault.
+        // The EC intercept substitutes arena refs for served mul_mat_id reads; anything else that
+        // lands here is a bug and the downstream nil-buffer assert will name it.
+        static int nb_decl = 0;
+        if (nb_decl++ < 8) {
+            fprintf(stderr, "[metal-getbid] nil-view tensor=%s buffer=%p size=%zu\n",
+                    ggml_get_name(t) ? ggml_get_name(t) : "?", (void *) buffer,
+                    ggml_backend_buffer_get_size(buffer));
+        }
+        return { nullptr, 0 };
+    }
+
+    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t) buffer->context;
     return ggml_metal_buffer_get_id(ctx, t);
 }
 
@@ -2707,6 +2735,33 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
 
+    // [Metal EC] hook-table intercept (NULL table => stock path, values below unchanged): when the
+    // sched copy phase engaged for this call, bind src0 to the slot arena and ids to the
+    // slot-indexed ring — same contract as the CUDA mul_mat_id intercept. Eager-only: capture must
+    // not run for EC-engaged calls (a captured blit bakes this call's slot map into every replay),
+    // so serve is declined under use_capture and input_cpy is refilled before legacy reads.
+    ggml_backend_ec_hooks * ec = ggml_backend_ec_hooks_ptr;
+    int32_t  ec_ne02 = ne02;   // C when serving, n_expert otherwise
+    uint64_t ec_nb21 = nb21;   // dense ring stride (ne[0] ints) when serving
+    if (ec && ec->active() && ec->served_copy_phase(op->src[0])) {
+        const struct ggml_metal_ec_ref arena = ggml_metal_ec_arena_ref(op->src[0]);
+        const struct ggml_metal_ec_ref ring  = ggml_metal_ec_ids_ref(op->src[0]);
+        if (!ctx->use_capture && ec->engaged_this_call(op->src[0]) && arena.metal && ring.metal) {
+            ggml_metal_ec_count_intercept();
+            bid_src0.metal = arena.metal;   // arena base: C contiguous slabs of stride nb02 (== slab)
+            bid_src0.offs  = arena.offs;
+            bid_src2.metal = ring.metal;    // this call's slot-indexed ids entry
+            bid_src2.offs  = ring.offs;
+            ec_ne02  = (int32_t) ec->cache_slots(op->src[0]);
+            ec_nb21  = ne20 * (uint64_t) sizeof(int32_t);   // compacted ring layout (CUDA mirror)
+        } else {
+            ggml_metal_ec_count_decline();
+            // the copy phase served this call from the arena but we cannot intercept it: refill
+            // input_cpy fully, then let the legacy path below read correct data
+            ec->fallback_full(op->src[0], nullptr);
+        }
+    }
+
     if (ggml_metal_op_mul_mat_id_use_mm(op, props_dev->has_simdgroup_mm)) {
         // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
@@ -2759,17 +2814,17 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         {
             ggml_metal_kargs_mul_mm_id_map0 args = {
-                ne02,
+                ec_ne02,   // [Metal EC] C when serving from the arena; ne02 stock
                 ne10,
                 ne11, // n_expert_used (bcast)
                 nb11,
                 nb12,
                 ne21, // n_tokens
                 ne20, // n_expert_used
-                nb21,
+                ec_nb21,   // [Metal EC] dense ring stride when serving; nb21 stock
             };
 
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ec_ne02, ne20);
 
             const size_t smem = pipeline.smem;
 
@@ -2785,7 +2840,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ec_ne02, 1, 1);
         }
 
         ggml_metal_op_concurrency_reset(ctx);
@@ -2807,7 +2862,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
-                /*.ne02  =*/ ne02,
+                /*.ne02  =*/ ec_ne02,   // [Metal EC] C when serving from the arena; ne02 stock
                 /*.nb01  =*/ nb01,
                 /*.nb02  =*/ nb02,
                 /*.nb03  =*/ nb03,
@@ -2837,7 +2892,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ec_ne02, 128, 1, 1);
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);

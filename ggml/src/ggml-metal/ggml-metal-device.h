@@ -360,7 +360,9 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
-
+void ggml_metal_ec_capture_device(ggml_metal_device_t dev);
+void * ggml_metal_ec_host_view(const struct ggml_tensor * t);
+int ggml_metal_ec_node_serve_eligible(const struct ggml_tensor * node);
 #ifdef __cplusplus
 }
 #endif
