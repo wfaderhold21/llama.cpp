@@ -1658,7 +1658,7 @@ static void ec_atexit_dump(void) {
             (unsigned long long) g_ec_audit_ok.load(), (unsigned long long) g_ec_audit_bad.load());
     if (g_perf.on()) {
         auto ms = [](std::atomic<uint64_t> & a) { return (double) a.load() / 1e6; };
-        printf("[ec-perf] pread %.0f ms/%llu | gate %.0f ms/%llu | blit %.0f ms/%llu | join %.0f ms/%llu | fillids %.0f ms/%llu | hit %.0f ms/%llu\\n",
+        printf("[ec-perf] pread %.0f ms/%llu | gate %.0f ms/%llu | blit %.0f ms/%llu | join %.0f ms/%llu | fillids %.0f ms/%llu | hit %.0f ms/%llu\n",
                ms(g_perf.pread_ns), (unsigned long long) g_perf.pread_n.load(),
                ms(g_perf.gate_ns),  (unsigned long long) g_perf.gate_n.load(),
                ms(g_perf.blit_ns),  (unsigned long long) g_perf.blit_n.load(),
