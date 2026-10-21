@@ -87,14 +87,104 @@ static std::atomic<uint64_t> g_ec_verify_ok{0}, g_ec_verify_bad{0}, g_ec_hoststa
 static std::atomic<uint64_t> g_ec_audit_ok{0}, g_ec_audit_bad{0};
 
 #define EC_ID_RING 4
-#define EC_STAGE_RING 2        // double-buffered staging per the design table
-#define EC_RING_CAP_INTS 512   // fixed ring capacity (decode-sized); grow path deferred to v1.1
-
 // pending-counter helpers: plain int + __atomic builtins keep structs movable/copyable (std::atomic
 // members would delete the move ctor that unordered_map rehashing needs). Semantics identical to
 // cudaEventQuery(ev) == cudaErrorNotReady — advisory only, same as CUDA's in_flight events.
 #define PEND_LOAD(p)   __atomic_load_n((p), __ATOMIC_RELAXED)
 #define PEND_ADD(p, n) __atomic_add_fetch((p), (n), __ATOMIC_RELAXED)
+
+#define EC_STAGE_RING 8        // [perf] 8-deep staging: lets fill_ids keep ~7 preads in flight while
+                               // earlier slabs blit; 2-deep serialized NVMe under blit latency (gen 4.8)
+// --- [policy] global routing-frequency table + optional profile file (CUDA-twin semantics) ------
+// freq[L*128+E] counts routes observed at env-gated; seeds hot-pins at setup and (LLAMA_EC_PROFILE)
+// persists across runs. Routing-transparent: changes WHICH experts stay resident, never WHICH route.
+#define EC_MAX_LAYERS 64
+#define EC_N_EXPERT_MAX 128
+static std::atomic<uint32_t> g_ec_freq[EC_MAX_LAYERS * EC_N_EXPERT_MAX];
+static int g_ec_pin_k     = 0;    // LLAMA_EC_PIN=K enables hot-pinning
+
+static void ec_profile_load(const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) return;
+    for (int l = 0; l < EC_MAX_LAYERS; l++) {
+        for (int e = 0; e < EC_N_EXPERT_MAX; e++) {
+            uint32_t v = 0;
+            if (fread(&v, 4, 1, f) != 1) { fclose(f); return; }
+            g_ec_freq[l*EC_N_EXPERT_MAX + e].store(v, std::memory_order_relaxed);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "[metal-ec] profile loaded: %s\n", path);
+}
+static void ec_profile_save(void) {
+    const char * path = getenv("LLAMA_EC_PROFILE");
+    if (!path || !path[0]) return;
+    char tmp[1024]; snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE * f = fopen(tmp, "wb");
+    if (!f) return;
+    for (int l = 0; l < EC_MAX_LAYERS; l++)
+        for (int e = 0; e < EC_N_EXPERT_MAX; e++) {
+            uint32_t v = g_ec_freq[l*EC_N_EXPERT_MAX + e].load(std::memory_order_relaxed);
+            fwrite(&v, 4, 1, f);
+        }
+    fclose(f);
+    rename(tmp, path);
+    fprintf(stderr, "[metal-ec] profile saved: %s\n", path);
+}
+
+// --- global staging ring (one for every entry; sized to the largest slab seen) --------------
+static id<MTLBuffer>           g_stage[EC_STAGE_RING];
+static int                     g_stage_pend[EC_STAGE_RING];
+static dispatch_semaphore_t    g_stage_done[EC_STAGE_RING];
+static int                     g_stage_next = 0;
+static uint64_t                g_stage_len  = 0;
+static void ec_stage_ring_ensure(id<MTLDevice> device, uint64_t slab) {
+    if (slab <= g_stage_len) return;                    // already sized for this slab
+    static id<MTLDevice> s_dev = nil;
+    if (!s_dev) { s_dev = device; [s_dev retain]; }
+    // drain: never drop buffers an in-flight blit may still be reading (resize happens at most a
+    // couple of times — slabs take a handful of distinct sizes across layers)
+    for (int i = 0; i < EC_STAGE_RING; i++) {
+        while (PEND_LOAD(&g_stage_pend[i]) > 0 && g_stage_done[i]) {
+            dispatch_semaphore_wait(g_stage_done[i], DISPATCH_TIME_FOREVER);
+        }
+    }
+    for (int i = 0; i < EC_STAGE_RING; i++) {
+        if (g_stage[i]) { [g_stage[i] release]; g_stage[i] = nil; }
+        g_stage[i] = [s_dev newBufferWithLength:(size_t) slab options:MTLResourceStorageModeShared];
+        [g_stage[i] retain];
+        g_stage_pend[i] = 0;                             // drained: only call between synced phases
+        if (!g_stage_done[i]) g_stage_done[i] = dispatch_semaphore_create(0);
+    }
+    g_stage_len = slab;
+}
+#define EC_RING_CAP_INTS 512   // fixed ring capacity (decode-sized); grow path deferred to v1.1
+
+// pending-counter helpers: plain int + __atomic builtins keep structs movable/copyable (std::atomic
+// members would delete the move ctor that unordered_map rehashing needs). Semantics identical to
+// cudaEventQuery(ev) == cudaErrorNotReady — advisory only, same as CUDA's in_flight events.
+
+// [perf] LLAMA_EC_PERF=1: aggregate time-in-hook stats, dumped at exit.
+#include <chrono>
+struct ec_perf {
+    std::atomic<uint64_t> pread_ns{0}, pread_n{0};
+    std::atomic<uint64_t> gate_ns{0}, gate_n{0};
+    std::atomic<uint64_t> blit_ns{0}, blit_n{0};          // submit side (fork+encode+commit)
+    std::atomic<uint64_t> join_ns{0}, join_n{0};          // per-slot join wait in fill_ids
+    std::atomic<uint64_t> fillids_ns{0}, fillids_n{0};    // whole fill_ids hook
+    std::atomic<uint64_t> hit_ns{0}, hit_n{0};            // resident-slot path (no fill)
+    std::atomic<uint64_t> intercept_ns{0}, intercept_n{0};
+    bool on() const { return getenv("LLAMA_EC_PERF") != nullptr; }
+};
+static ec_perf g_perf;
+static inline uint64_t ec_now_ns() {
+    using namespace std::chrono;
+    return (uint64_t) duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+struct ec_t { std::atomic<uint64_t> * dst; std::atomic<uint64_t> * n; uint64_t t0;
+             ec_t(std::atomic<uint64_t> & d, std::atomic<uint64_t> & c) : dst(&d), n(&c) { t0 = ec_now_ns(); }
+             ~ec_t() { dst->fetch_add(ec_now_ns() - t0, std::memory_order_relaxed); n->fetch_add(1, std::memory_order_relaxed); } };
+
 
 // MTLSharedEvent wrapper with a cudaEventQuery-mirror pending counter. Value semantics mirror
 // ggml_metal_event in ggml-metal-device.m (monotonic signal values).
@@ -150,9 +240,12 @@ struct ggml_metal_ec_entry {
     int      fd   = -1;
     uint64_t file_offs = 0;
 
-    id<MTLBuffer> stage[EC_STAGE_RING];        // StorageModeShared: host pread writes, blit reads
-    int           stage_pending[EC_STAGE_RING];
-    dispatch_semaphore_t stage_done[EC_STAGE_RING];
+    // [perf] staging ring is global (mirrors CUDA's single pinned ring), created lazily in
+    // ec_stage_ring_ensure(); per-entry rings at depth 2 serialized each layer's preads behind the
+    // previous blit's completion handler — the gen-4.8-t/s bottleneck. Fields kept but unused.
+    id<MTLBuffer> stage[1];                     // legacy: not allocated anymore
+    int           stage_pending[1];
+    dispatch_semaphore_t stage_done[1];
     int stage_next = 0;
 
     size_t   slab      = 0;   // nb[2] bytes per expert (identical math to CUDA)
@@ -167,6 +260,9 @@ struct ggml_metal_ec_entry {
 
     int      engaged = 0;
     int      partial_fill = 0;
+    int      layer_idx    = -1;   // [policy] blk.N parsed at creation; -1 = freq/pin disabled
+    int      prewarmed    = 0;    // [policy] top-k pins loaded once at first setup
+    int64_t  last_repin   = -1;   // [policy] gen bucket the pins were last recomputed at
     int      dbg_trace = 0;   // per-entry trace budget (LLAMA_EC_DEBUG_SLOT_VERIFY)
     int      dbg_ids   = 0;
     int      dbg_audit = 0;
@@ -354,7 +450,7 @@ static ggml_metal_ec_entry * lookup_or_create(ggml_backend_t backend, const ggml
                     ggml_get_name(host), e->host_base, host->data);
             if (e->fd >= 0) ::close(e->fd);
             if (e->arena) [e->arena release];
-            for (int i = 0; i < EC_STAGE_RING; i++) if (e->stage[i]) [e->stage[i] release];
+            // staging is global now; nothing per-entry to release
             for (int r = 0; r < EC_ID_RING; r++) {
                 if (e->ring_dst[r]) [e->ring_dst[r] release];
                 if (e->ring_src[r]) [e->ring_src[r] release];
@@ -377,6 +473,8 @@ static ggml_metal_ec_entry * lookup_or_create(ggml_backend_t backend, const ggml
     e.host_base = host->data;          // GGUF mmap base (slow, cold fallback — pages fault from file)
     e.slab      = host->nb[2];         // fused expert slab bytes: identical to CUDA
     e.n_expert  = host->ne[2];
+    { const char * nm = ggml_get_name(host); e.layer_idx = -1;
+      if (nm) { const char * q = strstr(nm, "blk."); if (q) { int L = atoi(q+4); if (L >= 0 && L < EC_MAX_LAYERS) e.layer_idx = L; } } }
     e.C         = ec_n_cached();
 
     // Metal device resolved from the tensor's buffer type (device->context IS ggml_metal_device_t
@@ -450,12 +548,8 @@ static ggml_metal_ec_entry * lookup_or_create(ggml_backend_t backend, const ggml
         [cb waitUntilCompleted];   // load-time only
     }
 
-    for (int i = 0; i < EC_STAGE_RING; i++) {
-        e.stage[i] = [device newBufferWithLength:e.slab options:MTLResourceStorageModeShared];
-        [e.stage[i] retain];
-        e.stage_pending[i] = 0;
-        e.stage_done[i] = dispatch_semaphore_create(0);
-    }
+    // [perf] staging ring is global (ec_stage_ring_ensure) — created on first fill, sized to the
+    // largest slab. No per-entry allocation.
 
     // dedicated copy command queue + fork event
     e.copyQ = [device newCommandQueue];
@@ -506,8 +600,48 @@ static int hook_is_gpu_buffer(const ggml_tensor * t) {
 static int hook_disk(const ggml_tensor * host) {
     auto it = g_entries.find(host);
     // g_entries stores entry VALUES (g_dev_idx stores pointers) — dot access here
-    return (it != g_entries.end() && it->second.disk && it->second.fd >= 0 &&
-            it->second.stage[0]) ? 1 : 0;
+    return (it != g_entries.end() && it->second.disk && it->second.fd >= 0) ? 1 : 0;
+}
+
+static int hook_lookup_or_evict(const ggml_tensor * dev, int32_t eid, int64_t * out_slot, int * out_need_copy);
+static int ec_copy_to_slot_impl(ggml_metal_ec_entry * e, int32_t eid, int64_t slot);   // fwd (defined below)
+
+// [policy] per-layer top-k pins + prewarm. g_ec_freq accumulates routes (shared across runs via
+// LLAMA_EC_PROFILE). At first setup for an entry: pread the top-k experts into slots and mark hot
+// (the existing 3-pass victim walk protects hot slots first). Every 64 gens the pin set is
+// recomputed from counts; slots outside it lose hot and re-enter LRU. Routing-transparent: only
+// residency order changes, never which expert the ids ring points at.
+static void ec_repin(ggml_metal_ec_entry * e, int do_prewarm) {
+    const int k = g_ec_pin_k > 0 ? g_ec_pin_k : (int) (e->C / 3);
+    if (e->layer_idx < 0 || k <= 0) return;
+    uint32_t top_e[EC_N_EXPERT_MAX]; uint32_t top_v[EC_N_EXPERT_MAX];
+    int nk = 0;
+    for (int cand = 0; cand < (int) e->n_expert; cand++) {
+        uint32_t v = g_ec_freq[e->layer_idx*EC_N_EXPERT_MAX + cand].load(std::memory_order_relaxed);
+        if (!v && !do_prewarm) continue;
+        int j = nk;
+        while (j > 0 && top_v[j-1] < v) { top_v[j] = top_v[j-1]; top_e[j] = top_e[j-1]; j--; }
+        if (nk < k) { nk++; }
+        top_v[j] = v; top_e[j] = cand;
+    }
+    // drop zero-freq candidates unless prewarming from a profile with data
+    while (nk > 0 && !top_v[nk-1]) nk--;
+    if (!nk) return;
+    bool is_pin[EC_N_EXPERT_MAX] = {};
+    for (int i = 0; i < nk; i++) is_pin[top_e[i]] = true;
+    for (int64_t s = 0; s < e->C; s++) {
+        const int32_t id = e->slots[s].expert_id;
+        if (id >= 0) e->slots[s].hot = is_pin[id];
+    }
+    if (!do_prewarm) return;
+    for (int i = 0; i < nk; i++) {
+        const int32_t eid = (int32_t) top_e[i];
+        if (e->slot_of_id[eid] >= 0) { e->slots[e->slot_of_id[eid]].hot = true; continue; }
+        int64_t s = -1; int need = 0;
+        if (!hook_lookup_or_evict(e->dev_ptr, eid, &s, &need) || !need) continue;
+        if (ec_copy_to_slot_impl(e, eid, s)) e->slots[s].hot = true;
+    }
+    e->prewarmed = 1;
 }
 
 static int hook_setup(ggml_backend_t backend, const ggml_tensor * host, ggml_tensor * dev, int64_t n_tokens, int64_t n_ids_elems) {
@@ -518,6 +652,7 @@ static int hook_setup(ggml_backend_t backend, const ggml_tensor * host, ggml_ten
     e->partial_fill = 0;
     // engage ONLY for decode-sized ubatches (mirrors CUDA; prefill keeps the legacy path byte-identical)
     e->engaged = (n_tokens <= 8 && e->C >= n_ids_elems) ? 1 : 0;
+    if (!e->prewarmed && e->gen >= 2) ec_repin(e, /*do_prewarm=*/1);   // once; after the first prompt
     e->last_ring_idx = -1;
     e->last_ids_n    = 0;
     g_ec_setups++;
@@ -587,32 +722,59 @@ static int hook_lookup_or_evict(const ggml_tensor * dev, int32_t eid, int64_t * 
 // miss fill: pread slab into the next free staging buffer (host blocks only on the NVMe read),
 // then blit onto copyQ ordered behind the fork event recorded on the device queue at issue time.
 static const ggml_tensor * host_nm_guard(const ggml_metal_ec_entry * e) { return e->host_ptr; }
+struct ec_timer2 {
+    std::atomic<uint64_t> * d; std::atomic<uint64_t> * n; uint64_t t0;
+    ec_timer2(std::atomic<uint64_t> & dd, std::atomic<uint64_t> & nn) : d(&dd), n(&nn) { t0 = ec_now_ns(); }
+    ~ec_timer2() { d->fetch_add(ec_now_ns() - t0, std::memory_order_relaxed); n->fetch_add(1, std::memory_order_relaxed); }
+};
+
 static int ec_copy_to_slot_impl(ggml_metal_ec_entry * e, int32_t eid, int64_t slot) {
     GGML_ASSERT(e && slot >= 0 && slot < e->C);
+    typedef ec_timer2 ec_timer;
+    static const bool perf_on = getenv("LLAMA_EC_PERF") != nullptr;   // cached: getenv per fill is a scan
+    std::unique_ptr<ec_timer> t_prep, t_pread, t_blit;
+    if (perf_on) t_prep.reset(new ec_timer(g_perf.gate_ns, g_perf.gate_n));
     if (getenv("LLAMA_EC_DEBUG_SLOT_VERIFY") && e->dbg_trace < 64) {
         e->dbg_trace++;
         fprintf(stderr, "[ec-fill] %s gen=%llu eid=%d slot=%lld was_res=%d\n", ggml_get_name(e->host_ptr),
                 (unsigned long long) e->gen, eid, (long long) slot, (int) (e->slot_of_id[eid] >= 0));
     }
 
-    int s = gate_pick(e->stage_pending, e->stage_done, EC_STAGE_RING, e->stage_next);
-    e->stage_next = (s + 1) % EC_STAGE_RING;
+    ec_stage_ring_ensure((id<MTLDevice>) ggml_metal_device_get_obj(e->mdev), e->slab);
+    int s = gate_pick(g_stage_pend, g_stage_done, EC_STAGE_RING, g_stage_next);
+    g_stage_next = (s + 1) % EC_STAGE_RING;
+    t_prep.reset();
 
     bool from_staging = false;
-    if (e->disk && e->fd >= 0 && e->stage[s]) {
-        ssize_t got = ::pread(e->fd, e->stage[s].contents, e->slab,
+    // [Mac-native fill] Host-readable arena (storageModeShared — what the adopted scheduler copy
+    // actually is on this build): pread STRAIGHT into the slot bytes. No staging ring, no memcpy,
+    // no blit, no fork/join, no command buffer. Correct because fills run in the scheduler copy
+    // phase, strictly before the graph's command buffer is committed, and shared stores are coherent
+    // with kernels in buffers committed after the store (Apple Silicon). The slot is never rebound
+    // while its old gen is in flight (victim rule), so no reader can observe a half-written slab.
+    if (e->disk && e->fd >= 0 && e->arena.contents) {
+        if (perf_on) t_pread.reset(new ec_timer(g_perf.pread_ns, g_perf.pread_n));
+        uint8_t * dst = (uint8_t *) e->arena.contents + e->arena_off + (size_t) slot * e->slab;
+        ssize_t got = ::pread(e->fd, dst, e->slab,
+                              (off_t) (e->file_offs + (uint64_t) eid * e->slab));
+        if (got == (ssize_t) e->slab) {
+            ggml_metal_ec_slot & sl0 = e->slots[slot];
+            sl0.expert_id = eid;
+            sl0.loading = false;                       // bytes already in place (synchronous fill)
+            g_ec_copy_bytes += e->slab;
+            g_ec_side_copies++;
+            return 1;
+        }
+        fprintf(stderr, "[metal-ec] disk pread short (%zd/%zu) eid=%d -> staging fallback\n",
+                got, e->slab, eid);
+    }
+    if (e->disk && e->fd >= 0 && g_stage[s] && !e->arena.contents) {
+        if (perf_on) t_pread.reset(new ec_timer(g_perf.pread_ns, g_perf.pread_n));
+        ssize_t got = ::pread(e->fd, g_stage[s].contents, e->slab,
                               (off_t) (e->file_offs + (uint64_t) eid * e->slab));
         if (got != (ssize_t) e->slab) {
             fprintf(stderr, "[metal-ec] disk pread short (%zd/%zu) eid=%d -> mapping fallback\n",
                     got, e->slab, eid);
-        } else if (e->arena.contents) {
-            // [debug] shared arena: same bytes via host store, blit skipped so .contents stays valid
-            memcpy((uint8_t *) e->arena.contents + e->arena_off + (size_t) slot * e->slab,
-                   e->stage[s].contents, e->slab);
-            from_staging = true;
-            g_ec_copy_bytes += e->slab;
-            g_ec_side_copies++;
-            return 1;
         } else {
             from_staging = true;
         }
@@ -620,8 +782,8 @@ static int ec_copy_to_slot_impl(ggml_metal_ec_entry * e, int32_t eid, int64_t sl
     if (!from_staging) {
         // mapping fallback: host_base pages demand-fault from the same file (slow but correct).
         // Blit encoders cannot read a raw host pointer, so copy into staging first.
-        if (!e->stage[s]) return 0;   // hook_disk() declines when the ring is empty
-        memcpy(e->stage[s].contents, (const uint8_t *) e->host_base + (size_t) eid * e->slab, e->slab);
+        if (!g_stage[s]) return 0;   // ring allocation failed: decline
+        memcpy(g_stage[s].contents, (const uint8_t *) e->host_base + (size_t) eid * e->slab, e->slab);
         from_staging = true;
     }
 
@@ -634,23 +796,22 @@ static int ec_copy_to_slot_impl(ggml_metal_ec_entry * e, int32_t eid, int64_t sl
     // later on the same queue, so FIFO ordering subsumes the join. A/B against copyQ to find which
     // half of the CUDA-mirror ordering is broken on Metal.
     const bool fill_on_dq = getenv("LLAMA_EC_FILL_ON_DQ") != nullptr;
+    if (perf_on) { t_prep.reset(); t_blit.reset(new ec_timer(g_perf.blit_ns, g_perf.blit_n)); }
     cb_commit_signal(e->fork_ev, dq);
 
     id<MTLCommandBuffer> cb = fill_on_dq ? [dq commandBuffer] : [e->copyQ commandBuffer];
     if (!fill_on_dq) evt_wait(e->fork_ev, cb);
     id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
-        [enc copyFromBuffer:e->stage[s] sourceOffset:0 toBuffer:e->arena
+        [enc copyFromBuffer:g_stage[s] sourceOffset:0 toBuffer:e->arena
               destinationOffset:e->arena_off + (size_t) slot * e->slab size:e->slab];
     [enc endEncoding];
 
     ggml_metal_ec_slot & sl = e->slots[slot];
     if (!sl.in_flight) sl.in_flight = evt_init((id<MTLDevice>) ggml_metal_device_get_obj(e->mdev));
     evt_signal(sl.in_flight, cb);
-    PEND_ADD(&e->stage_pending[s], 1);
-    dispatch_semaphore_t sdone = e->stage_done[s];
-    int sidx = s;
-    ggml_metal_ec_entry * ee = e;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> b){ GGML_UNUSED(b); PEND_ADD(&ee->stage_pending[sidx], -1); dispatch_semaphore_signal(sdone); }];
+    PEND_ADD(&g_stage_pend[s], 1);
+    dispatch_semaphore_t sdone = g_stage_done[s];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b){ GGML_UNUSED(b); PEND_ADD(&g_stage_pend[s], -1); dispatch_semaphore_signal(sdone); }];
 
     [cb commit];
     sl.loading = true;   // cleared when fill_ids joins the device queue onto this slot
@@ -677,25 +838,24 @@ static void ec_fill_dev_slabs(ggml_metal_ec_entry * e, const ggml_tensor * dev, 
         GGML_LOG_ERROR("%s: refusing blit into non-Metal buffer for %s\n", __func__, ggml_get_name(dev));
         return;
     }
+    ec_stage_ring_ensure((id<MTLDevice>) ggml_metal_device_get_obj(e->mdev), e->slab);
     for (int32_t eid = first_id; eid <= last_id; eid++) {
-        int s = gate_pick(e->stage_pending, e->stage_done, EC_STAGE_RING, e->stage_next);
-        e->stage_next = (s + 1) % EC_STAGE_RING;
-        if (!e->stage[s]) continue;   // staging failed at create: caller declined via hook_disk
+        int s = gate_pick(g_stage_pend, g_stage_done, EC_STAGE_RING, g_stage_next);
+        g_stage_next = (s + 1) % EC_STAGE_RING;
+        if (!g_stage[s]) continue;   // staging failed at create: caller declined via hook_disk
 
-        ssize_t got = ::pread(e->fd, e->stage[s].contents, e->slab,
+        ssize_t got = ::pread(e->fd, g_stage[s].contents, e->slab,
                               (off_t) (e->file_offs + (uint64_t) eid * e->slab));
         if (got != (ssize_t) e->slab) continue;   // short read: same policy as CUDA
 
         id<MTLCommandBuffer> cb = [dq commandBuffer];
         id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
-        [enc copyFromBuffer:e->stage[s] sourceOffset:0 toBuffer:(id<MTLBuffer>) bid_dst.metal
+        [enc copyFromBuffer:g_stage[s] sourceOffset:0 toBuffer:(id<MTLBuffer>) bid_dst.metal
               destinationOffset:bid_dst.offs + (size_t) eid * e->slab size:e->slab];
         [enc endEncoding];
-        PEND_ADD(&e->stage_pending[s], 1);
-        dispatch_semaphore_t sdone = e->stage_done[s];
-        ggml_metal_ec_entry * ee = e;
-        int sidx = s;
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> b){ GGML_UNUSED(b); PEND_ADD(&ee->stage_pending[sidx], -1); dispatch_semaphore_signal(sdone); }];
+        PEND_ADD(&g_stage_pend[s], 1);
+        dispatch_semaphore_t sdone = g_stage_done[s];
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> b){ GGML_UNUSED(b); PEND_ADD(&g_stage_pend[s], -1); dispatch_semaphore_signal(sdone); }];
         [cb commit];
     }
 }
@@ -729,12 +889,21 @@ static void hook_copy_slabs(ggml_backend_t backend, ggml_tensor * dev, int32_t f
 // pending copies) is committed HERE, before the graph encodes this call — fill_ids runs in the
 // sched copy phase ahead of graph_compute, exactly where CUDA's join lives.
 static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const int32_t * host_ids, int n) {
+    static const bool perf_on2 = getenv("LLAMA_EC_PERF") != nullptr;
+    std::unique_ptr<ec_timer2> t_all;
+    if (perf_on2) t_all.reset(new ec_timer2(g_perf.fillids_ns, g_perf.fillids_n));
     auto it = g_dev_idx.find(dev);
     GGML_ASSERT(it != g_dev_idx.end());
     ggml_metal_ec_entry * e = it->second;
     // the arena holds C slots; a call that routes more ids than C cannot be served from it - decline instead
     if (!e->engaged || (int64_t) n > e->C) return 0;
     if ((int64_t) n > EC_RING_CAP_INTS) return 0;   // fixed-cap decline (grow path deferred to v1.1)
+    // one layer per gen bucket (rotated) so a repin never stalls all 46 layers in one token
+    if (g_ec_pin_k > 0 && e->prewarmed && (e->gen % 64) == 0 &&
+        (e->layer_idx % 64) == (int) ((e->gen / 64) % 64) && (e->gen / 64) != e->last_repin) {
+        e->last_repin = e->gen / 64;
+        ec_repin(e, /*do_prewarm=*/0);
+    }
 
     GGML_UNUSED(backend);
     id<MTLCommandQueue> dq = device_queue(e);
@@ -755,6 +924,13 @@ static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const 
         if (s0 >= 0) {
             e->slots[s0].stamp_gen = e->gen;
             e->slots[s0].last_use  = e->gen;
+        }
+    }
+    if (e->layer_idx >= 0 && e->layer_idx < EC_MAX_LAYERS) {
+        for (int i = 0; i < n; i++) {
+            const int32_t eid = host_ids[i];
+            if (eid >= 0 && eid < e->n_expert)
+                g_ec_freq[e->layer_idx*EC_N_EXPERT_MAX + eid].fetch_add(1, std::memory_order_relaxed);
         }
     }
     for (int i = 0; i < n; i++) {
@@ -779,6 +955,9 @@ static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const 
             int need_copy = 0;
             hook_lookup_or_evict(dev, eid, &s, &need_copy);
             if (need_copy) hook_copy_to_slot(backend, dev, eid, s);
+        } else if (perf_on2) {
+            ec_timer2 t_hit(g_perf.hit_ns, g_perf.hit_n);
+            stage[i] = (int32_t) s; continue;
         }
         stage[i] = (int32_t) s;
     }
@@ -799,7 +978,8 @@ static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const 
         // evt_in_flight() has been observed to answer "settled" for blits still queued on copyQ
         // (clean8: correct bytes in slots, garbage tokens ~2 into decode = kernel read past an
         // unfinished fill). A spurious wait-only command buffer is cheap; a race is not.
-        cb_commit_wait(sl.in_flight, dq);
+        if (perf_on2) { ec_timer2 tj(g_perf.join_ns, g_perf.join_n); cb_commit_wait(sl.in_flight, dq); }
+        else cb_commit_wait(sl.in_flight, dq);
         sl.loading = false;
     }
 
@@ -812,9 +992,7 @@ static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const 
     [enc endEncoding];
     PEND_ADD(&e->ring_pending[r], 1);
     dispatch_semaphore_t rdone = e->ring_done[r];
-    ggml_metal_ec_entry * ee = e;
-    int ridx = r;
-    [cb addCompletedHandler:^(id<MTLCommandBuffer> b){ GGML_UNUSED(b); PEND_ADD(&ee->ring_pending[ridx], -1); dispatch_semaphore_signal(rdone); }];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b){ GGML_UNUSED(b); PEND_ADD(&e->ring_pending[r], -1); dispatch_semaphore_signal(rdone); }];
     [cb commit];
 
     // [debug] LLAMA_EC_DEBUG_SLOT_VERIFY: wait this call's copies, then memcmp every slot we are
@@ -1054,17 +1232,18 @@ static void hook_fallback_full(const ggml_tensor * dev, void * stream_v) {
         [cb0 waitUntilCompleted];
     }
 
-    if (e->disk && e->fd >= 0 && e->stage[0]) {
+    if (e->disk && e->fd >= 0) {
         ec_fill_dev_slabs(e, e->dev_ptr, 0, (int32_t) e->n_expert - 1);
         return;   // completion-ordered on the same queue: legacy reads after these blits
     }
-    if (!e->stage[0]) return;   // no staging ring: caller must decline instead of refilling
+    if (!g_stage[0]) ec_stage_ring_ensure((id<MTLDevice>) ggml_metal_device_get_obj(e->mdev), e->slab);
+    if (!g_stage[0]) return;   // no staging ring: caller must decline instead of refilling
     struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(ec_metal_ctx(e->dev_ptr->buffer, e->dev_ptr), e->dev_ptr);
     for (int32_t eid = 0; eid < e->n_expert; eid++) {
-        memcpy(e->stage[0].contents, (const uint8_t *) e->host_base + (size_t) eid * e->slab, e->slab);
+        memcpy(g_stage[0].contents, (const uint8_t *) e->host_base + (size_t) eid * e->slab, e->slab);
         id<MTLCommandBuffer> cb = [dq commandBuffer];
         id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
-        [enc copyFromBuffer:e->stage[0] sourceOffset:0 toBuffer:(id<MTLBuffer>) bid_dst.metal
+        [enc copyFromBuffer:g_stage[0] sourceOffset:0 toBuffer:(id<MTLBuffer>) bid_dst.metal
               destinationOffset:bid_dst.offs + (size_t) eid * e->slab size:e->slab];
         [enc endEncoding];
         [cb commit];
@@ -1075,6 +1254,7 @@ static void hook_fallback_full(const ggml_tensor * dev, void * stream_v) {
 }
 
 static void ec_atexit_dump(void) {
+    ec_profile_save();
     const uint64_t tot = g_ec_hits.load() + g_ec_misses.load();
     printf("[metal-expert-cache] C=%d engaged_lookups=%llu hits=%llu misses=%llu evicts=%llu hit_rate=%.4f fallbacks=%llu\n",
             ec_n_cached(), (unsigned long long) g_ec_calls.load(),
@@ -1086,6 +1266,16 @@ static void ec_atexit_dump(void) {
             (unsigned long long) g_ec_verify_ok.load(), (unsigned long long) g_ec_verify_bad.load(),
             (unsigned long long) g_ec_hoststale.load(),
             (unsigned long long) g_ec_audit_ok.load(), (unsigned long long) g_ec_audit_bad.load());
+    if (g_perf.on()) {
+        auto ms = [](std::atomic<uint64_t> & a) { return (double) a.load() / 1e6; };
+        printf("[ec-perf] pread %.0f ms/%llu | gate %.0f ms/%llu | blit %.0f ms/%llu | join %.0f ms/%llu | fillids %.0f ms/%llu | hit %.0f ms/%llu\\n",
+               ms(g_perf.pread_ns), (unsigned long long) g_perf.pread_n.load(),
+               ms(g_perf.gate_ns),  (unsigned long long) g_perf.gate_n.load(),
+               ms(g_perf.blit_ns),  (unsigned long long) g_perf.blit_n.load(),
+               ms(g_perf.join_ns),  (unsigned long long) g_perf.join_n.load(),
+               ms(g_perf.fillids_ns),(unsigned long long) g_perf.fillids_n.load(),
+               ms(g_perf.hit_ns),   (unsigned long long) g_perf.hit_n.load());
+    }
     printf("[metal-ec] copy_bytes=%lluMB side_blits=%llu intercepts=%llu declines=%llu setups=%llu fillids=%llu\n",
             (unsigned long long) (g_ec_copy_bytes.load() >> 20),
             (unsigned long long) g_ec_side_copies.load(),
@@ -1106,6 +1296,12 @@ void ggml_backend_ec_hooks_register_metal(void) {
     if (ggml_backend_ec_hooks_ptr) return;        // CUDA table wins in hybrid builds
     fprintf(stderr, "[ec-reg] hooks registered C=%d\n", ec_n_cached());
     done = true;
+    {   // [policy] env: LLAMA_EC_PIN=0 disables the pin policy; LLAMA_EC_PROFILE=<path> persists freq
+        const char * k = getenv("LLAMA_EC_PIN");
+        g_ec_pin_k = k ? atoi(k) : (int) ec_n_cached() / 3;   // default: C/3 pins
+        const char * pf = getenv("LLAMA_EC_PROFILE");
+        if (pf && pf[0]) ec_profile_load(pf);
+    }
 
     atexit(ec_atexit_dump);
 
