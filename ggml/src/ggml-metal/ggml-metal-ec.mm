@@ -38,9 +38,16 @@
 #include "../ggml-ec-hooks.h"
 #include "ggml-metal-device.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <pthread.h>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>    // disk source: open
@@ -195,6 +202,42 @@ struct ec_evt {
     dispatch_semaphore_t   done;    // posted by completion handler; rare bounded waits only
 };
 
+// --- [async] speculative background fill ---------------------------------------------------
+// Demand reads STAY on the decode thread inside the scheduler copy phase (before the graph
+// commit) — correctness first. A background worker instead spends the GPU-compute window
+// re-residing recently-evicted experts (skewed routing => reuse distance ~W > C), converting
+// tomorrow's demand misses into hits. Metadata (slot state, slot_of_id, LRU ticks, job deque)
+// lives under one global mutex; the pread itself runs UNLOCKED against a slot reserved LOADING
+// by its owner — worker and demand can therefore never duplicate a read nor expose half-written
+// bytes. Routing-transparent by construction: only slot PLACEMENT changes, ids never — greedy
+// output must stay byte-identical with the worker on or off.
+struct ggml_metal_ec_entry;
+enum ec_slot_st : uint8_t { EC_ST_FREE = 0, EC_ST_LOADING = 1, EC_ST_READY = 2 };
+enum ec_job_src : uint8_t { EC_JOB_PF = 0, EC_JOB_SWEEP = 1 };   // both advisory: drop if stale
+struct ec_job { ggml_metal_ec_entry * e; int32_t eid; };
+static std::mutex              g_ec_mtx;
+static std::condition_variable g_ec_cv;
+static std::deque<ec_job>      g_ec_jobs;          // bounded, advisory
+static std::atomic<bool>       g_ec_quit{false};
+// [demand-parallel] the same pool also serves DEMAND fills: the served-copy phase posts every
+// need_copy slot of a layer as a high-priority job (demand=1: the slot is ALREADY claimed by
+// demand — the worker only reads bytes, demand settles), then barrier-waits for the layer.
+// N workers x ~5ms/pread compresses the ~110-serial-pread/token chain toward 110/N.
+struct ec_djob { ggml_metal_ec_entry * e; int32_t eid; int64_t slot; };
+static std::deque<ec_djob>     g_ec_djobs;         // high priority: drained before PF jobs
+static std::atomic<int>        g_ec_dpend{0};      // posted-not-yet-settled demand jobs
+static std::condition_variable g_ec_dcv;
+static int                     g_nworkers = 4;
+static std::atomic<uint64_t>   g_dbar_ns{0}, g_dbar_n{0}, g_dwave_n{0};  // [diag] barrier wall
+static bool                    g_async_on = false; // set in ggml_backend_ec_hooks_register_metal
+static std::atomic<uint64_t>   g_ec_pf_hit{0}, g_ec_pf_fill{0}, g_ec_pf_drop{0};
+static std::mutex                          g_ec_entries_mtx;
+static std::vector<ggml_metal_ec_entry *>  g_ec_entries;   // stable addresses (map values)
+static bool ec_pf_claim_locked(ggml_metal_ec_entry * e, int32_t eid, int64_t * out);
+static void ec_pf_enqueue(ggml_metal_ec_entry * e, int32_t eid);
+static void * ec_worker_thread(void *);
+static void ec_start_worker_once(void);
+
 static ec_evt * evt_init(id<MTLDevice> dev) {
     ec_evt * e = new ec_evt();
     e->ev = [dev newSharedEvent];
@@ -222,10 +265,18 @@ static void evt_wait(ec_evt * ev, id<MTLCommandBuffer> cb) {
 
 struct ggml_metal_ec_slot {
     int32_t  expert_id = -1;      // expert currently resident (-1 = never used)
+    ec_slot_st state = EC_ST_FREE;// [async] FREE | LOADING (owned: loading_eid set) | READY
+    int32_t  loading_eid = -1;    // eid under pread while LOADING (owner: demand or worker)
+    bool     was_prefetched = false; // worker-filled; counted the first time demand uses it
     uint64_t last_use  = 0;       // LRU tick (call generation)
     ec_evt * in_flight = nullptr; // slot-copy completion event (side queue)
-    bool     loading   = false;
-    bool     hot       = false;   // preheat deferred to v1.1; fresh occupants are always cold
+    bool     loading   = false;   // legacy join flag for the blit fallback (cb_commit_wait)
+    bool     hot       = false;   // pin segment (policy layer); worker may never evict these
+    bool     bound_unfinished = false; // [async] bound into a committed graph whose logits sync
+                                       // has not returned: worker must not recycle. Set when
+                                       // fill_ids binds the ring; cleared at the NEXT fill_ids
+                                       // for this entry — decode reaches fill_ids only after
+                                       // sampling the previous token, a full device-sync proof.
     uint64_t stamp_gen = 0;       // generation of the call that last touched this slot
 };
 
@@ -263,6 +314,12 @@ struct ggml_metal_ec_entry {
     int      layer_idx    = -1;   // [policy] blk.N parsed at creation; -1 = freq/pin disabled
     int      prewarmed    = 0;    // [policy] top-k pins loaded once at first setup
     int64_t  last_repin   = -1;   // [policy] gen bucket the pins were last recomputed at
+    // [async] worker handshake: teardown (stale-entry rail on model reload) must not yank
+    // arena/fd from under an in-flight speculative pread. Teardown flips alive=0 under g_ec_mtx
+    // (blocks new claims), drops queued jobs, then waits for in_pf to drain (bounded: one pread).
+    // Plain ints + __atomic builtins: std::atomic members would delete the move ctor.
+    int alive = 1;
+    int in_pf = 0;
     int      dbg_trace = 0;   // per-entry trace budget (LLAMA_EC_DEBUG_SLOT_VERIFY)
     int      dbg_ids   = 0;
     int      dbg_audit = 0;
@@ -438,6 +495,18 @@ static ggml_metal_buffer_t ec_metal_ctx(ggml_backend_buffer_t buffer, const ggml
     return (ggml_metal_buffer_t) buffer->context;
 }
 
+// [async] quiesce speculative fills before destroying/rebuilding an entry (model reload rail).
+static void ec_entry_quiesce(ggml_metal_ec_entry * e) {
+    {
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        __atomic_store_n(&e->alive, 0, __ATOMIC_RELEASE);     // no new claims
+        for (auto it = g_ec_jobs.begin(); it != g_ec_jobs.end(); )
+            it = (it->e == e) ? g_ec_jobs.erase(it) : it + 1;
+    }
+    while (__atomic_load_n(&e->in_pf, __ATOMIC_RELAXED) > 0)  // bounded: one pread
+        sched_yield();
+}
+
 static ggml_metal_ec_entry * lookup_or_create(ggml_backend_t backend, const ggml_tensor * host, const ggml_tensor * dev) {
     auto it = g_entries.find(host);
     if (it != g_entries.end()) {
@@ -448,6 +517,7 @@ static ggml_metal_ec_entry * lookup_or_create(ggml_backend_t backend, const ggml
         if (e->host_base != host->data || e->slab != host->nb[2] || e->n_expert != host->ne[2]) {
             fprintf(stderr, "[metal-ec] STALE entry %s — host moved (%p -> %p), rebuilding\n",
                     ggml_get_name(host), e->host_base, host->data);
+            ec_entry_quiesce(e);   // [async] wait out speculative fills before yanking fd/arena
             if (e->fd >= 0) ::close(e->fd);
             if (e->arena) [e->arena release];
             // staging is global now; nothing per-entry to release
@@ -473,6 +543,9 @@ static ggml_metal_ec_entry * lookup_or_create(ggml_backend_t backend, const ggml
     e.host_base = host->data;          // GGUF mmap base (slow, cold fallback — pages fault from file)
     e.slab      = host->nb[2];         // fused expert slab bytes: identical to CUDA
     e.n_expert  = host->ne[2];
+    __atomic_store_n(&e.alive, 1, __ATOMIC_RELEASE);          // [async] (re)enable after build
+    __atomic_store_n(&e.in_pf, 0, __ATOMIC_RELAXED);
+    { std::lock_guard<std::mutex> el(g_ec_entries_mtx); g_ec_entries.push_back(&e); }  // [async]
     { const char * nm = ggml_get_name(host); e.layer_idx = -1;
       if (nm) { const char * q = strstr(nm, "blk."); if (q) { int L = atoi(q+4); if (L >= 0 && L < EC_MAX_LAYERS) e.layer_idx = L; } } }
     e.C         = ec_n_cached();
@@ -652,6 +725,7 @@ static int hook_setup(ggml_backend_t backend, const ggml_tensor * host, ggml_ten
     e->partial_fill = 0;
     // engage ONLY for decode-sized ubatches (mirrors CUDA; prefill keeps the legacy path byte-identical)
     e->engaged = (n_tokens <= 8 && e->C >= n_ids_elems) ? 1 : 0;
+    if (e->engaged) ec_start_worker_once();   // [async] lazy start: only when serving begins
     if (!e->prewarmed && e->gen >= 2) ec_repin(e, /*do_prewarm=*/1);   // once; after the first prompt
     e->last_ring_idx = -1;
     e->last_ids_n    = 0;
@@ -666,24 +740,93 @@ static int hook_lookup_or_evict(const ggml_tensor * dev, int32_t eid, int64_t * 
     ggml_metal_ec_entry * e = it->second;   // value IS a pointer here (g_dev_idx stores entry*)
     GGML_ASSERT(eid >= 0 && eid < e->n_expert);
 
+    // [async] hit lookup under the metadata lock. A worker may own the mapping (state LOADING,
+    // loading_eid == eid): then WAIT on its read instead of duplicating the pread — a bounded
+    // one-pread wait, never worse than reading it ourselves, and a prefetch that lands in time
+    // for demand converts a would-be miss into a counted hit.
+    if (g_async_on) {
+        std::unique_lock<std::mutex> lk(g_ec_mtx);
+        const int64_t s0 = e->slot_of_id[eid];
+        if (s0 >= 0) {
+            ggml_metal_ec_slot & sl0 = e->slots[s0];
+            if (sl0.state == EC_ST_READY && sl0.expert_id == eid) {
+                sl0.stamp_gen = e->gen;
+                sl0.last_use  = e->gen;
+                if (sl0.was_prefetched) { g_ec_pf_hit++; sl0.was_prefetched = false; }
+                *out_slot = s0; *out_need_copy = 0;
+                e->partial_fill = 1;
+                g_ec_hits++; g_ec_calls++;
+                return 1;
+            }
+            if (sl0.state == EC_ST_LOADING && sl0.loading_eid == eid) {
+                g_ec_cv.wait_for(lk, std::chrono::milliseconds(200), [&] {
+                    return g_ec_quit.load() || e->slot_of_id[eid] != s0 ||
+                           e->slots[s0].state == EC_ST_READY ||
+                           (e->slots[s0].state == EC_ST_LOADING && e->slots[s0].loading_eid != eid);
+                });
+                const int64_t s1 = e->slot_of_id[eid];
+                if (s1 >= 0 && e->slots[s1].state == EC_ST_READY && e->slots[s1].expert_id == eid) {
+                    ggml_metal_ec_slot & sl1 = e->slots[s1];
+                    sl1.stamp_gen = e->gen;
+                    sl1.last_use  = e->gen;
+                    if (sl1.was_prefetched) { g_ec_pf_hit++; sl1.was_prefetched = false; }
+                    *out_slot = s1; *out_need_copy = 0;
+                    e->partial_fill = 1;
+                    g_ec_hits++; g_ec_calls++;
+                    return 1;
+                }
+                if (s1 >= 0 && e->slots[s1].state == EC_ST_LOADING && e->slots[s1].loading_eid == eid) {
+                    // owner stalled past the wait (or died mid-read): steal the claim so demand can
+                    // read it now. The owner's settle validates its claim and will no-op after.
+                    e->slot_of_id[eid] = -1;
+                    e->slots[s1].state       = EC_ST_FREE;
+                    e->slots[s1].expert_id   = -1;
+                    e->slots[s1].loading_eid = -1;
+                }
+                // fall through to normal victim selection
+            }
+        }
+    }
     if (e->slot_of_id[eid] >= 0) {
         int64_t s = e->slot_of_id[eid];
-        e->slots[s].stamp_gen = e->gen;      // touched this call: never evict
-        e->slots[s].last_use  = e->gen;
-        *out_slot      = s;
-        *out_need_copy = 0;
-        e->partial_fill = 1;                 // legacy full copy was skipped for this slab
-        g_ec_hits++;
-        g_ec_calls++;
-        return 1;
+        if (g_async_on && !(e->slots[s].state == EC_ST_READY && e->slots[s].expert_id == eid)) {
+            // stale mapping (claim/settle interleaving): drop it and re-claim below
+            e->slot_of_id[eid] = -1;
+        } else {
+            e->slots[s].stamp_gen = e->gen;      // touched this call: never evict
+            e->slots[s].last_use  = e->gen;
+            *out_slot      = s;
+            *out_need_copy = 0;
+            e->partial_fill = 1;                 // legacy full copy was skipped for this slab
+            g_ec_hits++;
+            g_ec_calls++;
+            return 1;
+        }
     }
 
     // victim: empty slot > LRU-oldest unstamped > LRU-oldest (never stamp this call's own ids).
     // hot slots evicted only after every cold candidate is exhausted (preheat deferred to v1.1,
     // so pass 0 degenerates); in-flight copies are safe to overwrite (queue ordering), but prefer
     // finished ones — the same three passes as CUDA.
+    std::unique_ptr<std::lock_guard<std::mutex>> vlk;   // [async] claim atomic vs the worker
+    if (g_async_on) vlk.reset(new std::lock_guard<std::mutex>(g_ec_mtx));
+    if (e->slot_of_id[eid] >= 0 && e->slots[e->slot_of_id[eid]].state == EC_ST_READY &&
+        e->slots[e->slot_of_id[eid]].expert_id == eid) {
+        // became resident while we were unlocked between the hit probe and here: take the hit
+        const int64_t sh = e->slot_of_id[eid];
+        e->slots[sh].stamp_gen = e->gen;
+        e->slots[sh].last_use  = e->gen;
+        if (e->slots[sh].was_prefetched) { g_ec_pf_hit++; e->slots[sh].was_prefetched = false; }
+        *out_slot = sh; *out_need_copy = 0;
+        e->partial_fill = 1;
+        g_ec_hits++; g_ec_calls++;
+        vlk.reset();
+        return 1;
+    }
     int64_t victim = -1;
     for (int64_t s = 0; s < e->C; s++) {
+        // fresh never-used slots are FREE by design: open to demand AND worker. Only LOADING is owned.
+        if (g_async_on && e->slots[s].state == EC_ST_LOADING) continue;
         if (e->slots[s].expert_id < 0) { victim = s; break; }
     }
     if (victim < 0) {
@@ -691,6 +834,7 @@ static int hook_lookup_or_evict(const ggml_tensor * dev, int32_t eid, int64_t * 
             uint64_t oldest = UINT64_MAX;
             for (int64_t s = 0; s < e->C; s++) {
                 const ggml_metal_ec_slot & sl = e->slots[s];
+                if (g_async_on && sl.state == EC_ST_LOADING) continue;  // [async] owned by a reader
                 if (sl.stamp_gen == e->gen) continue;          // in use by this call
                 if (sl.hot && pass == 0) continue;
                 const bool inflight = sl.in_flight && evt_in_flight(sl.in_flight);
@@ -702,6 +846,7 @@ static int hook_lookup_or_evict(const ggml_tensor * dev, int32_t eid, int64_t * 
     GGML_ASSERT(victim >= 0);   // only possible if EVERY slot is stamp==gen: C < routed width
 
     ggml_metal_ec_slot & sl = e->slots[victim];
+    const int32_t evicted = sl.expert_id;
     if (sl.expert_id >= 0) {
         e->slot_of_id[sl.expert_id] = -1;
         g_ec_evicts++;
@@ -710,12 +855,19 @@ static int hook_lookup_or_evict(const ggml_tensor * dev, int32_t eid, int64_t * 
     sl.hot         = false;     // fresh occupants are cold; only preheat marks hot (deferred v1.1)
     sl.stamp_gen   = e->gen;
     sl.last_use    = e->gen;
+    if (g_async_on) { sl.state = EC_ST_LOADING; sl.loading_eid = eid; sl.was_prefetched = false; }
     e->slot_of_id[eid] = victim;
     *out_slot      = victim;
     *out_need_copy = 1;
     e->partial_fill = 1;
     g_ec_misses++;
     g_ec_calls++;
+    vlk.reset();   // claim recorded; the pread itself runs unlocked in the caller
+    // [async] the expert we just evicted is the single most likely near-future re-demand (skewed
+    // routing, reuse distance ~W>C): queue it for the speculative worker, which will pread it back
+    // into some free slot during the GPU window. Advisory: a PF job whose eid got resolved gets
+    // dropped at fill time.
+    if (g_async_on && evicted >= 0) ec_pf_enqueue(e, evicted);
     return 1;
 }
 
@@ -761,12 +913,22 @@ static int ec_copy_to_slot_impl(ggml_metal_ec_entry * e, int32_t eid, int64_t sl
             ggml_metal_ec_slot & sl0 = e->slots[slot];
             sl0.expert_id = eid;
             sl0.loading = false;                       // bytes already in place (synchronous fill)
+            if (g_async_on) { sl0.state = EC_ST_READY; sl0.loading_eid = -1; g_ec_cv.notify_all(); }
             g_ec_copy_bytes += e->slab;
             g_ec_side_copies++;
             return 1;
         }
         fprintf(stderr, "[metal-ec] disk pread short (%zd/%zu) eid=%d -> staging fallback\n",
                 got, e->slab, eid);
+        if (g_async_on) {
+            // hand the claim back so later demand can retry cleanly
+            ggml_metal_ec_slot & slf = e->slots[slot];
+            if (slf.state == EC_ST_LOADING && slf.loading_eid == eid) {
+                e->slot_of_id[eid] = -1;
+                slf.state = EC_ST_FREE; slf.expert_id = -1; slf.loading_eid = -1;
+                g_ec_cv.notify_all();
+            }
+        }
     }
     if (e->disk && e->fd >= 0 && g_stage[s] && !e->arena.contents) {
         if (perf_on) t_pread.reset(new ec_timer(g_perf.pread_ns, g_perf.pread_n));
@@ -827,6 +989,187 @@ static int hook_copy_to_slot(ggml_backend_t backend, const ggml_tensor * dev, in
     return ec_copy_to_slot_impl(it->second, eid, slot);
 }
 
+// --- [async] worker + PF queue ------------------------------------------------------------
+// [demand-parallel] post one already-claimed slot for a worker to read, then (barrier=1) wait
+// for the whole wave to settle. Called from the scheduler copy phase BEFORE the graph commit, so
+// slot bytes are complete before any kernel reads them — same lifetime contract as the serial
+// path, just N-way parallel preads. A slot still LOADING after the wave (worker died / short
+// read) is filled synchronously by the caller: correctness never depends on the pool.
+static void ec_demand_post_wait(ggml_metal_ec_entry * e, int32_t eid, int64_t slot) {
+    {
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        // no PF clear (a full clear starved speculation: pf landed=7 and demand still paid its
+        // full pread chain). Workers drain demand jobs first; PF reads interleave in the gaps.
+        g_ec_djobs.push_back(ec_djob{e, eid, slot});
+        g_ec_dpend++;                              // under the lock: barrier can't race the post
+    }
+    g_ec_cv.notify_one();
+}
+
+static void ec_demand_drain_barrier(void) {
+    const uint64_t t0 = ec_now_ns();
+    std::unique_lock<std::mutex> lk(g_ec_mtx);
+    g_ec_dcv.wait_for(lk, std::chrono::milliseconds(500),
+                      [] { return g_ec_quit.load() || g_ec_dpend.load() <= 0; });
+    g_dbar_ns += ec_now_ns() - t0;
+    g_dbar_n++;
+}
+
+static void ec_pf_enqueue(ggml_metal_ec_entry * e, int32_t eid) {
+    if (!g_async_on || eid < 0) return;
+    {
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        if (g_ec_jobs.size() >= 4096) g_ec_jobs.pop_front();     // bounded; drop oldest (advisory)
+        g_ec_jobs.push_back(ec_job{e, eid});
+    }
+    g_ec_cv.notify_one();
+}
+
+// PF victim pick (caller holds g_ec_mtx): empty READY > oldest unstamped READY. Never touch:
+// LOADING (owner mid-read), bound_unfinished (committed graph may still read it), hot (policy),
+// stamped for the current call.
+static bool ec_pf_claim_locked(ggml_metal_ec_entry * e, int32_t eid, int64_t * out) {
+    if (e->slot_of_id[eid] >= 0) return false;
+    int64_t victim = -1;
+    for (int64_t s = 0; s < e->C; s++) {
+        ggml_metal_ec_slot & sl = e->slots[s];
+        if ((sl.state == EC_ST_READY || sl.state == EC_ST_FREE) && sl.expert_id < 0 &&
+            !sl.bound_unfinished && !sl.hot) { victim = s; break; }     // never-used: best victim
+    }
+    if (victim < 0) {
+        uint64_t oldest = UINT64_MAX;
+        for (int64_t s = 0; s < e->C; s++) {
+            ggml_metal_ec_slot & sl = e->slots[s];
+            if (sl.state == EC_ST_LOADING) continue;
+            if (sl.bound_unfinished || sl.hot || sl.stamp_gen == e->gen) continue;
+            if (sl.last_use < oldest) { oldest = sl.last_use; victim = s; }
+        }
+    }
+    if (victim < 0) return false;
+    ggml_metal_ec_slot & sl = e->slots[victim];
+    if (sl.expert_id >= 0) e->slot_of_id[sl.expert_id] = -1;
+    sl.state       = EC_ST_LOADING;
+    sl.loading_eid = eid;
+    sl.expert_id   = -1;
+    sl.hot         = false;
+    e->slot_of_id[eid] = victim;
+    *out = victim;
+    return true;
+}
+
+// [demand-parallel] worker reads bytes into a slot demand already reserved (state LOADING,
+// loading_eid=eid, mapping set by hook_lookup_or_evict). The slot is NOT touched here beyond the
+// byte write — demand owns the settle (READY or rollback), so the graph-visible contract stays
+// exactly as before. A dead/foreign claim is skipped: demand's own pread fallback covers it.
+static void ec_demand_fill_one(ggml_metal_ec_entry * e, int32_t eid, int64_t s) {
+    if (!e || eid < 0 || eid >= (int32_t) e->n_expert || s < 0 || s >= e->C) { g_ec_dpend--; g_ec_dcv.notify_all(); return; }
+    bool mine = false;
+    {
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        ggml_metal_ec_slot & sl = e->slots[s];
+        mine = __atomic_load_n(&e->alive, __ATOMIC_ACQUIRE) &&
+               e->slot_of_id[eid] == s && sl.state == EC_ST_LOADING && sl.loading_eid == eid;
+        if (mine) __atomic_add_fetch(&e->in_pf, 1, __ATOMIC_RELAXED);
+    }
+    if (mine && e->disk && e->fd >= 0 && e->arena && e->arena.contents &&
+        e->host_ptr->data == e->host_base) {
+        uint8_t * dst = (uint8_t *) e->arena.contents + e->arena_off + (size_t) s * e->slab;
+        ssize_t got = ::pread(e->fd, dst, e->slab, (off_t) (e->file_offs + (uint64_t) eid * e->slab));
+        if (got == (ssize_t) e->slab) {
+            std::lock_guard<std::mutex> lk(g_ec_mtx);
+            ggml_metal_ec_slot & sl = e->slots[s];
+            // settle as READY right now: demand's post-barrier check converts it to a hit path
+            if (sl.state == EC_ST_LOADING && sl.loading_eid == eid && e->slot_of_id[eid] == s) {
+                sl.expert_id   = eid;
+                sl.state       = EC_ST_READY;
+                sl.loading_eid = -1;
+                sl.last_use    = e->gen;                 // stamped at fill: safe to recycle later
+                g_ec_copy_bytes += e->slab;
+                g_ec_side_copies++;
+            }
+        }
+        // short read: leave LOADING; demand re-checks and does its own (fallback) pread
+        std::lock_guard<std::mutex> lk2(g_ec_mtx);
+        __atomic_sub_fetch(&e->in_pf, 1, __ATOMIC_RELAXED);
+    } else if (mine) {
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        __atomic_sub_fetch(&e->in_pf, 1, __ATOMIC_RELAXED);
+    }
+    g_ec_dpend--;
+    g_ec_dcv.notify_all();
+}
+
+static bool ec_pf_fill_one(ggml_metal_ec_entry * e, int32_t eid) {
+    if (!e || eid < 0 || eid >= (int32_t) e->n_expert) return false;
+    if (!e->disk || e->fd < 0 || !e->arena || !e->arena.contents) return false;   // direct-fill only
+    if (e->host_ptr->data != e->host_base) return false;                          // stale-entry rail
+    int64_t s = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        if (!__atomic_load_n(&e->alive, __ATOMIC_ACQUIRE) ||
+            !ec_pf_claim_locked(e, eid, &s)) { g_ec_pf_drop++; return false; }
+        __atomic_add_fetch(&e->in_pf, 1, __ATOMIC_RELAXED);   // teardown waits for us
+    }
+    uint8_t * dst = (uint8_t *) e->arena.contents + e->arena_off + (size_t) s * e->slab;
+    ssize_t got = ::pread(e->fd, dst, e->slab, (off_t) (e->file_offs + (uint64_t) eid * e->slab));
+    bool ok = (got == (ssize_t) e->slab);
+    std::lock_guard<std::mutex> lk(g_ec_mtx);
+    __atomic_sub_fetch(&e->in_pf, 1, __ATOMIC_RELAXED);
+    ggml_metal_ec_slot & sl = e->slots[s];
+    if (sl.state == EC_ST_LOADING && sl.loading_eid == eid) {           // still ours?
+        if (ok && e->slot_of_id[eid] == s) {
+            sl.expert_id      = eid;
+            sl.state          = EC_ST_READY;
+            sl.loading_eid    = -1;
+            sl.was_prefetched = true;
+            sl.last_use       = e->gen;
+            g_ec_pf_fill++;
+            g_ec_copy_bytes += e->slab;
+        } else {                                                        // roll our claim back
+            if (e->slot_of_id[eid] == s) e->slot_of_id[eid] = -1;
+            sl.state = EC_ST_FREE; sl.expert_id = -1; sl.loading_eid = -1;
+            g_ec_pf_drop++; ok = false;
+        }
+        g_ec_cv.notify_all();
+    } else {
+        g_ec_pf_drop++;   // demand stole the slot while we read: our bytes are orphaned, harmless
+    }
+    return ok;
+}
+
+static void ec_start_worker_once(void) {
+    static bool started = false;
+    if (started || !g_async_on) return;
+    started = true;
+    const char * wn = getenv("LLAMA_EC_WORKERS");
+    if (wn) g_nworkers = atoi(wn);
+    if (g_nworkers < 1) g_nworkers = 1;
+    if (g_nworkers > 16) g_nworkers = 16;
+    for (int i = 0; i < g_nworkers; i++) {
+        pthread_t t;
+        pthread_create(&t, nullptr, ec_worker_thread, nullptr);
+        pthread_detach(t);
+    }
+    fprintf(stderr, "[metal-ec] %d fill worker(s) online\n", g_nworkers);
+}
+
+static void * ec_worker_thread(void *) {
+    for (;;) {
+        ec_job       j{nullptr, 0};
+        ec_djob      dj{nullptr, 0, -1};
+        bool         have_d = false;
+        {
+            std::unique_lock<std::mutex> lk(g_ec_mtx);
+            g_ec_cv.wait(lk, [] { return g_ec_quit.load() || !g_ec_jobs.empty() || !g_ec_djobs.empty(); });
+            if (g_ec_quit.load()) return nullptr;
+            if (!g_ec_djobs.empty())     { dj  = g_ec_djobs.front();  g_ec_djobs.pop_front();  have_d = true; }
+            else if (!g_ec_jobs.empty()) { j   = g_ec_jobs.front();   g_ec_jobs.pop_front(); }
+        }
+        if (have_d) ec_demand_fill_one(dj.e, dj.eid, dj.slot);
+        else        ec_pf_fill_one(j.e, j.eid);
+    }
+}
+
 // [disk source] scheduler legacy-copy replacement: fill input_cpy slab [first_id, last_id] from the
 // GGUF through the staging ring ON THE DEVICE QUEUE — same ordering contract as the stock
 // set_async-from-host it replaces (graph reads are ordered behind it on that queue).
@@ -874,6 +1217,39 @@ static void hook_copy_slabs(ggml_backend_t backend, ggml_tensor * dev, int32_t f
         // a bounded copy holds C slots only, so this call's ids must fit in the arena. Route them through the
         // entry slots instead of blitting into the tensor; a wider call cannot be served.
         if (!e->engaged || (last_id - first_id + 1) > e->C) return;
+        static const bool dpar = g_async_on && [] {
+            const char * d = getenv("LLAMA_EC_DEMAND_PAR");
+            return !(d && atoi(d) == 0);
+        }();
+        // decode-only in practice: the bounded branch already requires e->engaged (set per call
+        // from n_tokens<=8), and prefill MoE runs on CPU — this hook never fires for prompt.
+        if (dpar) {
+            // wave: claim every miss, post all reads to the pool, barrier, then settle what the
+            // pool could not finish (sync fallback) — all still before the graph commit.
+            struct ec_wf { int32_t eid; int64_t slot; };
+            ec_wf wave[512];
+            int   nw = 0;
+            for (int32_t eid = first_id; eid <= last_id; eid++) {
+                int64_t slot;
+                int need_copy = 0;
+                hook_lookup_or_evict(dev, eid, &slot, &need_copy);
+                if (need_copy && nw < 512) wave[nw++] = ec_wf{ eid, slot };
+            }
+            g_dwave_n += nw;
+            for (int i = 0; i < nw; i++) ec_demand_post_wait(e, wave[i].eid, wave[i].slot);
+            if (nw) ec_demand_drain_barrier();
+            for (int i = 0; i < nw; i++) {
+                bool ready = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_ec_mtx);
+                    ggml_metal_ec_slot & sl = e->slots[wave[i].slot];
+                    ready = sl.state == EC_ST_READY && sl.expert_id == wave[i].eid &&
+                            e->slot_of_id[wave[i].eid] == wave[i].slot;
+                }
+                if (!ready) ec_copy_to_slot_impl(e, wave[i].eid, wave[i].slot);   // sync fallback
+            }
+            return;
+        }
         for (int32_t eid = first_id; eid <= last_id; eid++) {
             int64_t slot;
             int need_copy = 0;
@@ -916,6 +1292,13 @@ static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const 
     // run. Without it, the LRU walk below treats this call's own HIT slots as stale victims (their
     // stamp is from an earlier gen) and a later miss in the SAME call overwrites a slot the ring is
     // about to point at — slot_of[hit]=-1 while the kernel reads the slot, i.e. garbage MoE outputs.
+    // [async] we are gen G+1's fill_ids: reaching here proves the logits for gen G were sampled
+    // (a device-sync point), so gen G's kernels are retired — release their bindings so the worker
+    // may recycle those slots.
+    if (g_async_on) {
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        for (int64_t s = 0; s < e->C; s++) e->slots[s].bound_unfinished = false;
+    }
     int32_t * stage = e->ring_host[r];
     for (int i = 0; i < n; i++) {
         const int32_t eid = host_ids[i];
@@ -960,6 +1343,13 @@ static int hook_fill_ids(ggml_backend_t backend, const ggml_tensor * dev, const 
             stage[i] = (int32_t) s; continue;
         }
         stage[i] = (int32_t) s;
+    }
+
+    // [async] bind: gen G's kernels will read these slots; block worker recycling until gen G+1's
+    // fill_ids clears the flags (the logits-sync proof above makes that safe).
+    if (g_async_on) {
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        for (int i = 0; i < n; i++) e->slots[stage[i]].bound_unfinished = true;
     }
 
     // join: the graph's command buffers must be ordered behind pending slot copies — including
@@ -1276,6 +1666,11 @@ static void ec_atexit_dump(void) {
                ms(g_perf.fillids_ns),(unsigned long long) g_perf.fillids_n.load(),
                ms(g_perf.hit_ns),   (unsigned long long) g_perf.hit_n.load());
     }
+    printf("[metal-ec] dbar: %llu ms / %llu waves (jobs %llu)\n",
+           (unsigned long long) (g_dbar_ns / 1000000ULL), (unsigned long long) g_dbar_n.load(),
+           (unsigned long long) g_dwave_n.load());
+    printf("[metal-ec] pf: landed=%llu saved_as_hit=%llu dropped=%llu\n",
+           (unsigned long long) g_ec_pf_fill.load(), (unsigned long long) g_ec_pf_hit.load(), (unsigned long long) g_ec_pf_drop.load());
     printf("[metal-ec] copy_bytes=%lluMB side_blits=%llu intercepts=%llu declines=%llu setups=%llu fillids=%llu\n",
             (unsigned long long) (g_ec_copy_bytes.load() >> 20),
             (unsigned long long) g_ec_side_copies.load(),
@@ -1301,6 +1696,12 @@ void ggml_backend_ec_hooks_register_metal(void) {
         g_ec_pin_k = k ? atoi(k) : (int) ec_n_cached() / 3;   // default: C/3 pins
         const char * pf = getenv("LLAMA_EC_PROFILE");
         if (pf && pf[0]) ec_profile_load(pf);
+    }
+    {   // [async] LLAMA_EC_ASYNC=0 keeps the synchronous demand path (regression/A-B control)
+        const char * a = getenv("LLAMA_EC_ASYNC");
+        g_async_on = !(a && atoi(a) == 0);
+        static void * (*s_pf)(void *) = &ec_worker_thread;   // defined below; captured at reg
+        (void) s_pf;
     }
 
     atexit(ec_atexit_dump);
