@@ -225,7 +225,7 @@ static std::atomic<bool>       g_ec_quit{false};
 // N workers x ~5ms/pread compresses the ~110-serial-pread/token chain toward 110/N.
 struct ec_djob { ggml_metal_ec_entry * e; int32_t eid; int64_t slot; };
 static std::deque<ec_djob>     g_ec_djobs;         // high priority: drained before PF jobs
-static std::atomic<int>        g_ec_dpend{0};      // posted-not-yet-settled demand jobs
+static std::atomic<int>        g_ec_dpend{0};      // posted-not-yet-settled demand jobs (mutated under g_ec_mtx)
 static std::condition_variable g_ec_dcv;
 static int                     g_nworkers = 4;
 static std::atomic<uint64_t>   g_dbar_ns{0}, g_dbar_n{0}, g_dwave_n{0};  // [diag] barrier wall
@@ -1095,7 +1095,11 @@ static void ec_demand_fill_one(ggml_metal_ec_entry * e, int32_t eid, int64_t s) 
         std::lock_guard<std::mutex> lk(g_ec_mtx);
         __atomic_sub_fetch(&e->in_pf, 1, __ATOMIC_RELAXED);
     }
-    g_ec_dpend--;
+    {   // publish under the lock: an unlocked decrement+notify can land in the barrier's
+        // predicate-check-to-sleep window and strand the wave for its full 500ms timeout.
+        std::lock_guard<std::mutex> lk(g_ec_mtx);
+        g_ec_dpend--;
+    }
     g_ec_dcv.notify_all();
 }
 
